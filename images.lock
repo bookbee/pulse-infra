@@ -1,0 +1,61 @@
+# pulse-infra — pinned container images
+#
+# Every image in the stack is pinned by DIGEST, not tag. A tag is a moving
+# pointer; a digest is the bytes. Reproducibility is this repo's highest-value
+# property, and a tag silently re-pushed upstream is the most common way a
+# "works on my machine" local stack starts differing between laptops.
+#
+# These are MANIFEST-LIST digests (OCI image index), not platform-specific ones.
+# That matters: a per-platform digest resolved on an arm64 laptop cannot be
+# pulled on amd64. Each entry below was verified to carry both linux/amd64 and
+# linux/arm64.
+#
+# Resolved:      2026-09-12
+# Resolved on:   Darwin arm64 (Apple Silicon), Docker 29.7.2
+# Verified arch: linux/arm64 — full stack pulled, run and verified
+#                linux/amd64 — present in every index above; pulled and executed
+#                              under emulation (redis reports x86_64 and starts).
+#                              NOT yet verified on a native amd64 host: nobody has
+#                              run `make up && make verify` there. Do that before
+#                              calling amd64 supported.
+#
+# Note: `docker pull --platform linux/amd64 <image>@<digest>` fails locally with
+# "cannot overwrite digest" once the arm64 variant is cached under that same
+# digest reference. That is a local image-store limitation, not a problem with
+# the pin — pull by tag, or use a clean store, to inspect the other arch.
+#
+# ─── Bump procedure (deliberate, never automatic) ────────────────────────────
+#   1. ./bootstrap/resolve-digests.sh          # reports drift, writes nothing
+#   2. Edit BOTH this file and compose/compose.yaml — the digest appears in each
+#   3. make reset && make up && make verify
+#   4. Commit the digest change on its own, with the resolution date updated
+#
+# Never bump an image as a side effect of another change. If a pull fails
+# because upstream removed a digest, that is a decision to make, not a thing to
+# paper over by reverting to a tag.
+
+# ─── Kafka ───────────────────────────────────────────────────────────────────
+# KRaft mode, no ZooKeeper. The official Apache image: multi-arch, and its KRaft
+# support is first-class rather than bolted on.
+apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+
+# ─── Redis ───────────────────────────────────────────────────────────────────
+# 7.x deliberately: pulse-gateway documents Redis 7.x as its requirement.
+# Alpine variant to keep the footprint down.
+library/redis:7.4.11-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+
+# ─── fake-gcs-server ─────────────────────────────────────────────────────────
+# GCS staging stand-in. Served over HTTP, unauthenticated — see docs/divergences.md.
+fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+
+# ─── NOT pinned: pulse-gateway ───────────────────────────────────────────────
+# The gateway is built from source at ../pulse-gateway using that repo's own
+# Dockerfile (added 2026-09-13). It is therefore the
+# one component whose bytes are NOT reproducible from this file — it follows
+# whatever commit is checked out in the sibling repo. Its base images:
+#   golang:1.26-alpine  (build stage)
+#   alpine:3.21         (runtime stage)
+# Those are tag-pinned, not digest-pinned, because they are rebuilt locally
+# rather than pulled as the artifact. If the gateway's build output ever needs to
+# be reproducible, the fix is a Dockerfile and a published image in that repo —
+# not more pinning here.

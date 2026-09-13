@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "LOCAL DEVELOPMENT FIXTURE. Every value here is fake and intentionally so.",
+    "Never copy this shape into a real deployment: production auth keys are",
+    "injected by DevOps and never live in a repo.",
+    "",
+    "allowed_routes is an EXACT string match against the full request path --",
+    "no wildcards, no trailing slash, and the /telemetry prefix included. It is",
+    "enforced for API keys ONLY: a valid JWT reaches every authenticated route",
+    "regardless of what is listed here.",
+    "",
+    "/metrics must be listed explicitly for a key that scrapes it.",
+    "",
+    "jwtSecrets are HMAC shared secrets (HS256/HS384/HS512). Mint a local token",
+    "with bootstrap/mint-dev-jwt.sh. Only JWT-authenticated requests get an",
+    "event_header on the Redis payload -- API-key requests do not."
+  ],
+
+  "pulse_client_local": {
+    "keys": ["local-not-a-secret-client-key"],
+    "allowed_routes": [
+      "/telemetry/events/v1",
+      "/telemetry/logs/v1",
+      "/telemetry/signals/v1"
+    ]
+  },
+
+  "pulse_infra_smoke": {
+    "keys": ["local-not-a-secret-smoke-key"],
+    "allowed_routes": [
+      "/telemetry/events/v1",
+      "/telemetry/logs/v1",
+      "/telemetry/signals/v1",
+      "/metrics"
+    ]
+  },
+
+  "jwtSecrets": [
+    "local-not-a-secret-jwt-primary",
+    "local-not-a-secret-jwt-secondary"
+  ]
+}

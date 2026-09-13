@@ -1,0 +1,328 @@
+# pulse-infra — local development stack
+#
+# LOCAL DEVELOPMENT ONLY. Not staging, not production. See docs/divergences.md.
+#
+# Images are pinned by manifest-list digest (multi-arch: linux/amd64 + linux/arm64).
+# Digests and their resolution date live in ../images.lock — bump them there, deliberately.
+#
+# Profiles:
+#   core  Kafka cluster (3 brokers) + fake-gcs-server       — the ingestor's world
+#   full  everything: Kafka + Redis + fake-gcs + gateway    — end-to-end local runs
+#   lite  single-broker Kafka + fake-gcs-server             — low-resource fallback
+#
+# lite and core/full share host ports and MUST NOT run simultaneously. `make reset`
+# between profile switches.
+
+name: pulse-infra
+
+x-kafka-image: &kafka-image
+  image: apache/kafka@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+
+# Settings identical across every broker in the 3-node cluster.
+x-kafka-cluster-env: &kafka-cluster-env
+  CLUSTER_ID: OxPnkSDZTdOzZy0VFXwmYg
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  # RF=3 with min.insync.replicas=2 is what makes "kill one broker, stays writable"
+  # a real test. min.insync.replicas=3 would make the cluster unwritable on one loss.
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_NUM_PARTITIONS: "6"
+  # Off deliberately: topics are contract, not a side effect of a typo'd producer.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  # 0 makes consumer-group rebalances immediate and therefore observable.
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_LOG_RETENTION_HOURS: "24"
+  KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+
+x-kafka-healthcheck: &kafka-healthcheck
+  # Per-broker liveness. Cluster-level readiness (all brokers in metadata + a topic
+  # can actually be created) is the bootstrap gate's job — see bootstrap/wait-for-cluster.sh.
+  test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+  interval: 10s
+  timeout: 10s
+  retries: 12
+  start_period: 30s
+
+services:
+  # ─── Kafka: 3-broker KRaft cluster (no ZooKeeper) ──────────────────────────
+  kafka-1:
+    <<: *kafka-image
+    container_name: pulse-kafka-1
+    profiles: [core, full]
+    ports: ["19092:19092"]
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:19092
+    volumes: ["kafka-1-data:/var/lib/kafka/data"]
+    # F-013 (same class of bug as the gateway): a broker needs time for
+    # controlled shutdown — leadership migration and a clean log flush. Measured
+    # 3.4s on an idle cluster, which is already at the implicit default, and it
+    # grows with partition count and load. A SIGKILLed broker restarts with an
+    # unclean shutdown and rescans its logs; with min.insync.replicas=2 it also
+    # leaves partitions under-replicated for longer than necessary.
+    stop_grace_period: 30s
+    healthcheck: *kafka-healthcheck
+    networks: [pulse]
+
+  kafka-2:
+    <<: *kafka-image
+    container_name: pulse-kafka-2
+    profiles: [core, full]
+    ports: ["19093:19093"]
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:19093
+    volumes: ["kafka-2-data:/var/lib/kafka/data"]
+    # Controlled shutdown headroom — see kafka-1 (F-013).
+    stop_grace_period: 30s
+    healthcheck: *kafka-healthcheck
+    networks: [pulse]
+
+  kafka-3:
+    <<: *kafka-image
+    container_name: pulse-kafka-3
+    profiles: [core, full]
+    ports: ["19094:19094"]
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:9092,EXTERNAL://localhost:19094
+    volumes: ["kafka-3-data:/var/lib/kafka/data"]
+    # Controlled shutdown headroom — see kafka-1 (F-013).
+    stop_grace_period: 30s
+    healthcheck: *kafka-healthcheck
+    networks: [pulse]
+
+  # ─── Kafka: single broker, `lite` profile only ─────────────────────────────
+  # No rebalancing, no ISR behaviour, RF=1. See docs/divergences.md.
+  kafka-lite:
+    <<: *kafka-image
+    container_name: pulse-kafka-lite
+    profiles: [lite]
+    ports: ["19092:19092"]
+    environment:
+      CLUSTER_ID: OxPnkSDZTdOzZy0VFXwmYg
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-lite:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-lite:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_NUM_PARTITIONS: "6"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_RETENTION_HOURS: "24"
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    volumes: ["kafka-lite-data:/var/lib/kafka/data"]
+    # Controlled shutdown headroom — see kafka-1 (F-013).
+    stop_grace_period: 30s
+    healthcheck: *kafka-healthcheck
+    networks: [pulse]
+
+  # ─── fake-gcs-server: GCS staging stand-in ─────────────────────────────────
+  # HTTP, not HTTPS: the self-signed cert would need trust-store work in Rust,
+  # Java, Go and Node. Consumers point STORAGE_EMULATOR_HOST here. Unauthenticated.
+  #
+  # No stop_grace_period (F-013 review): it writes each object synchronously and
+  # holds nothing to flush at shutdown — measured 0.3s, exit 0. The one-shot
+  # bootstrap services are likewise exempt: they exit on their own, and stopping
+  # one mid-run loses nothing that the next `make up` does not redo.
+  fake-gcs:
+    image: fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+    container_name: pulse-fake-gcs
+    profiles: [core, full, lite]
+    command:
+      - -scheme=http
+      - -port=4443
+      - -public-host=fake-gcs:4443
+      - -backend=filesystem
+      - -filesystem-root=/data
+      - -log-level=warn
+    ports: ["4443:4443"]
+    volumes: ["fake-gcs-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:4443/storage/v1/b?project=pulse-local >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [pulse]
+
+  # ─── Redis: gateway's queue backend ────────────────────────────────────────
+  # noeviction is load-bearing: the gateway's error model depends on writes
+  # failing loudly rather than keys being evicted out from under a consumer.
+  redis:
+    image: redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    container_name: pulse-redis
+    profiles: [full]
+    command:
+      - redis-server
+      - --requirepass
+      - pulse-local-not-a-secret
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - "yes"
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    # F-013: with appendonly on, SIGTERM makes Redis flush the AOF before
+    # exiting. Measured 0.4s at this data size, so the implicit default is not
+    # currently binding — but this is the container holding everything the
+    # gateway just worked so hard to drain, and the cost of being explicit is
+    # zero. 15s is ample for a 512mb cap.
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a pulse-local-not-a-secret ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 3s
+    networks: [pulse]
+
+  # ─── Cluster readiness gate + bootstrap (core/full) ────────────────────────
+  # Creates topics and the staging bucket. Idempotent: re-running is a no-op.
+  # Nothing downstream starts until this exits 0.
+  bootstrap:
+    <<: *kafka-image
+    container_name: pulse-bootstrap
+    profiles: [core, full]
+    depends_on:
+      kafka-1: {condition: service_healthy}
+      kafka-2: {condition: service_healthy}
+      kafka-3: {condition: service_healthy}
+      fake-gcs: {condition: service_healthy}
+    environment:
+      KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      EXPECTED_BROKERS: "3"
+      TOPIC_PARTITIONS: "6"
+      TOPIC_REPLICATION_FACTOR: "3"
+      TOPIC_MIN_INSYNC_REPLICAS: "2"
+      GCS_ENDPOINT: http://fake-gcs:4443
+      GCS_BUCKET: pulse-staging-local
+    volumes: ["../bootstrap:/bootstrap:ro"]
+    entrypoint: ["/bin/bash", "/bootstrap/bootstrap.sh"]
+    restart: "no"
+    networks: [pulse]
+
+  # ─── Cluster readiness gate + bootstrap (lite) ─────────────────────────────
+  bootstrap-lite:
+    <<: *kafka-image
+    container_name: pulse-bootstrap-lite
+    profiles: [lite]
+    depends_on:
+      kafka-lite: {condition: service_healthy}
+      fake-gcs: {condition: service_healthy}
+    environment:
+      KAFKA_BOOTSTRAP: kafka-lite:9092
+      EXPECTED_BROKERS: "1"
+      TOPIC_PARTITIONS: "6"
+      TOPIC_REPLICATION_FACTOR: "1"
+      TOPIC_MIN_INSYNC_REPLICAS: "1"
+      GCS_ENDPOINT: http://fake-gcs:4443
+      GCS_BUCKET: pulse-staging-local
+    volumes: ["../bootstrap:/bootstrap:ro"]
+    entrypoint: ["/bin/bash", "/bootstrap/bootstrap.sh"]
+    restart: "no"
+    networks: [pulse]
+
+  # ─── pulse-gateway ─────────────────────────────────────────────────────────
+  # Built from the sibling repo using ITS OWN Dockerfile, so the local stack and
+  # anything else building that image (CI, a dev environment) produce the same
+  # thing from the same recipe.
+  # PREREQUISITE: ../../pulse-gateway must be checked out. This service is the
+  # one thing in the stack that is NOT digest-pinned; it is built from source,
+  # so it follows whatever commit is checked out there.
+  gateway:
+    build:
+      context: ../../pulse-gateway
+      dockerfile: Dockerfile
+    image: pulse-infra/gateway:local
+    container_name: pulse-gateway
+    profiles: [full]
+    depends_on:
+      redis: {condition: service_healthy}
+      bootstrap: {condition: service_completed_successfully}
+    env_file: ["./gateway.env"]
+    volumes:
+      - "../bootstrap/fixtures/api_keys.local.json:/etc/pulse/auth_keys.json:ro"
+    ports: ["8080:8080"]
+    # F-013. Must exceed the gateway's own worst-case shutdown, or Docker
+    # SIGKILLs mid-drain and every accepted-but-unpublished event is lost with
+    # no flush, no dead-letter and no log — silently undoing DEL-008, which made
+    # the gateway flush in-flight batches on a context that outlives cancellation.
+    #
+    # Budget, from gateway.env and the gateway's shutdown path:
+    #   SHUTDOWN_TIMEOUT=30s .................................. 30s
+    #     (fiber shutdown + drainBuffers share one 30s context)
+    #   one flush round, per worker, in parallel:
+    #   (WORKER_MAX_RETRIES 3 + 1) x WORKER_PUBLISH_TIMEOUT_MS 6s  24s
+    #   ------------------------------------------------------------------
+    #                                                            54s -> 60s
+    # Measured against a live stack: a round does take ~24s, and the drain does
+    # abort at 30s, so the arithmetic holds. 45s would not.
+    #
+    # This is a ceiling, not a cost. With Redis healthy the drain finishes and
+    # the process exits in ~0.9s even under 4k events of load (verified).
+    #
+    # KNOWN GAP — 60s is not sufficient when Redis is UNREACHABLE, and no fixed
+    # value here would be. The budget above assumes ONE post-drain flush round,
+    # but workerLoop's select has ctx.Done() as one case among six buffer-channel
+    # receives, and Go picks randomly among ready cases: while events remain
+    # buffered, a worker keeps taking them and flushing 100-event batches instead
+    # of returning. Each round costs another ~24s, so the tail scales with the
+    # backlog (up to 45k buffered events), not with this constant. Measured with
+    # Redis paused: round 1 at +24s, drain abort at +30s, round 2 at +49s,
+    # SIGKILL at 60s mid-round-3 — for a backlog of only 300 events.
+    # Fixing that means bounding the post-cancel flush in pulse-gateway
+    # (internal/worker/pool.go); it cannot be fixed from this file. See F-013.
+    #
+    # If you change SHUTDOWN_TIMEOUT, WORKER_MAX_RETRIES or
+    # WORKER_PUBLISH_TIMEOUT_MS in gateway.env, recompute this.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/livez >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [pulse]
+
+# ─── Extension point: Iceberg REST catalog (silver) ──────────────────────────
+# Deliberately not built. Silver is out of the local loop: the silver worker
+# reads GCS staging and writes Iceberg, and neither is exercised locally.
+# When it comes in scope, it belongs here as its own profile — not in `full`.
+
+networks:
+  pulse:
+    name: pulse-infra
+
+volumes:
+  kafka-1-data: {name: pulse-infra-kafka-1-data}
+  kafka-2-data: {name: pulse-infra-kafka-2-data}
+  kafka-3-data: {name: pulse-infra-kafka-3-data}
+  kafka-lite-data: {name: pulse-infra-kafka-lite-data}
+  fake-gcs-data: {name: pulse-infra-fake-gcs-data}
+  redis-data: {name: pulse-infra-redis-data}
