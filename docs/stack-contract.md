@@ -6,7 +6,44 @@ a breaking change for four-plus repos** (`pulse-gateway`, `pulse-ingestor`,
 topic name, a port, a bucket path or a Redis key here and something else stops
 working — coordinate the change across those repos in the same breath.
 
-Everything below was verified against a running stack, not copied from intent.
+Everything marked `live` below was verified against a running stack, not copied
+from intent. Rows marked `contracted-not-yet-listening` are agreed interfaces
+that nothing implements yet, and say so — see "Changing this contract".
+
+## Changing this contract
+
+**Every new port, topic, Redis key or bucket path is a change to this page, and
+the entry lands in the same change as the code that creates it** — not in a
+follow-up, not "once it works". A listener that exists without a row here is
+invisible to the repos that have to reach it, and the reverse costs more than it
+looks: `pulse-client` is specified not to restate an address this repo owns, so a
+missing row does not degrade it, it blocks it.
+
+That rule needs somewhere to put an interface that has been agreed but not yet
+built, or it quietly encourages the opposite mistake — leaving a ratified address
+off the page because nothing answers on it yet. Hence a **`Status` column on the
+Ports table**:
+
+| Status | Meaning | In `make verify` |
+|---|---|---|
+| `live` | Published and answering on the `full` profile | Probed. An unreachable `live` entry **fails** the suite |
+| `live (lite)` | Live only on the `lite` profile | Skipped — the suite runs `full` |
+| `internal` | In-network only, no host port | Skipped, with the reason printed |
+| `contracted-not-yet-listening` | Ratified by the owning repo; nothing listening yet | Skipped, with the reason printed |
+
+`contracted-not-yet-listening` is a promise about the *address*, not about
+reachability: code against it and it will not move under you, but do not expect a
+connection. When the listener lands, publishing the port and flipping the row to
+`live` are the same change.
+
+Check 6 of `make verify` reads this table and probes it, so the page cannot drift
+from the running stack in either direction: a `live` row that stops answering
+fails the suite, and a `contracted-not-yet-listening` row that *starts* answering
+is reported as drift to be resolved by flipping it to `live`.
+
+The other tables carry the same idea in prose rather than a column — the Kafka
+topics table says "written by gateway (future)" for exactly this reason. Only the
+Ports table is machine-checked, because only it is probeable.
 
 ## Service inventory
 
@@ -29,22 +66,45 @@ Digests are in [`../images.lock`](../images.lock). Docker network: `pulse-infra`
 Container-internal names are what in-network consumers use; host ports are for
 processes running on the laptop outside Docker.
 
-| Service | In-network address | Host address | Notes |
-|---|---|---|---|
-| Kafka broker 1 | `kafka-1:9092` | `localhost:19092` | `INTERNAL` / `EXTERNAL` listeners |
-| Kafka broker 2 | `kafka-2:9092` | `localhost:19093` | |
-| Kafka broker 3 | `kafka-3:9092` | `localhost:19094` | |
-| Kafka (lite) | `kafka-lite:9092` | `localhost:19092` | Reuses broker 1's host port |
-| Kafka controllers | `kafka-N:9093` | not published | KRaft quorum, internal only |
-| Redis | `redis:6379` | `localhost:6379` | |
-| fake-gcs-server | `fake-gcs:4443` | `localhost:4443` | **HTTP**, not HTTPS |
-| Gateway | `gateway:8080` | `localhost:8080` | |
+| Service | In-network address | Host address | Status | Notes |
+|---|---|---|---|---|
+| Kafka broker 1 | `kafka-1:9092` | `localhost:19092` | `live` | `INTERNAL` / `EXTERNAL` listeners |
+| Kafka broker 2 | `kafka-2:9092` | `localhost:19093` | `live` | |
+| Kafka broker 3 | `kafka-3:9092` | `localhost:19094` | `live` | |
+| Kafka (lite) | `kafka-lite:9092` | `localhost:19092` | `live (lite)` | Reuses broker 1's host port |
+| Kafka controllers | `kafka-N:9093` | not published | `internal` | KRaft quorum, internal only |
+| Redis | `redis:6379` | `localhost:6379` | `live` | |
+| fake-gcs-server | `fake-gcs:4443` | `localhost:4443` | `live` | **HTTP**, not HTTPS |
+| Gateway HTTP | `gateway:8080` | `localhost:8080` | `live` | Fiber |
+| Gateway gRPC | `gateway:9090` | `localhost:9090` | `contracted-not-yet-listening` | Owned by `pulse-gateway` `ADR-009`. **Nothing listens yet**, and the host port is deliberately not published — see below |
 
 **Bootstrap servers**, in-network: `kafka-1:9092,kafka-2:9092,kafka-3:9092`.
 From the host: `localhost:19092,localhost:19093,localhost:19094`.
 
 `lite` and `core`/`full` both bind host port 19092 and **must not run at the
 same time**. `make reset` between profile switches.
+
+### Gateway gRPC, 9090 — contracted, not published
+
+`pulse-gateway` has ratified a gRPC transport on its own port: `ADR-009` in its
+`specs/001-telemetry-ingestion/plan.md` §5, with `GRPC-001`…`GRPC-011` in
+`spec.md` pinning the semantics. Fiber is `fasthttp` and cannot serve `grpc-go`
+on one listener; `cmux` and Connect were both considered and rejected. 9090 was
+picked because it is free against everything else on this page. That ADR records
+this row as the cross-repo dependency it creates.
+
+**The row exists so the address is resolvable. Nothing listens on it.** Every
+`GRPC-*` requirement is `MISS` at the gateway's current commit — the contract is
+agreed, the server is unwritten.
+
+The host port is **deliberately not published in `compose/compose.yaml`**, and
+the trade is worth stating because it is close. Publishing `9090:9090` now would
+cost nothing to start and save one line of diff later, but `make ps` and `make
+health` would then advertise `0.0.0.0:9090->9090/tcp` for an endpoint that
+refuses every connection — health output that lies, which is the one thing this
+stack is for. Not publishing costs a second edit when the listener lands, in a
+change that has to touch this file anyway to flip the row to `live`. A missing
+answer is cheaper to live with than a wrong one.
 
 ## Kafka topics
 
@@ -136,8 +196,17 @@ The gateway's contract, as implemented in its `internal/queue/redis/producer.go`
 | `/readyz` | GET | none | `200` + buffer/Redis detail |
 | `/metrics` | GET | API key or JWT | Prometheus text |
 
-**HTTP only — there is no gRPC endpoint.** `pulse-client` is specified to drive
-both; only HTTP exists to drive.
+**HTTP is the only transport listening — but the gRPC surface is specified, not
+undefined.** `pulse-gateway` owns and has ratified it: three unary RPCs
+(`PublishEvent`, `PublishLog`, `PublishSignal`) mapping 1:1 onto the three
+telemetry routes, on `gateway:9090`, with envelope parity, status-code mapping
+and a shared route allowlist all pinned by `GRPC-001`…`GRPC-011`. The address is
+in the Ports table above and will not move. What does not exist is the server:
+every one of those requirements is `MISS` at the gateway's current commit.
+
+So `pulse-client` — specified to drive both transports — can resolve the gRPC
+endpoint from this page today, and can drive only HTTP until the listener lands.
+See [`divergences.md`](divergences.md).
 
 ### Auth, exactly as implemented
 
