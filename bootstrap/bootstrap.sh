@@ -7,6 +7,10 @@
 #
 # Runs inside the apache/kafka image (Alpine: bash + BusyBox wget, no curl).
 # Every value comes from the environment — see compose/compose.yaml.
+#
+# WHAT gets provisioned is not hardcoded here: it is read from the dependency
+# registry (registry/dependencies.tsv), which is where consumer projects declare
+# what they need. This script provisions what is registered and nothing else.
 set -euo pipefail
 
 KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:?}"
@@ -15,12 +19,14 @@ TOPIC_PARTITIONS="${TOPIC_PARTITIONS:?}"
 TOPIC_REPLICATION_FACTOR="${TOPIC_REPLICATION_FACTOR:?}"
 TOPIC_MIN_INSYNC_REPLICAS="${TOPIC_MIN_INSYNC_REPLICAS:?}"
 GCS_ENDPOINT="${GCS_ENDPOINT:?}"
-GCS_BUCKET="${GCS_BUCKET:?}"
+REGISTRY="${REGISTRY:-/registry/dependencies.tsv}"
 
-# Topic names deliberately mirror the gateway's Redis key names, so one
-# vocabulary covers both transports. Changing these breaks four-plus repos —
-# see docs/stack-contract.md.
-TOPICS="ingestion-events ingestion-signals ingestion-logs"
+[ -r "$REGISTRY" ] || { printf '[bootstrap] FAILED: registry %s not readable\n' "$REGISTRY" >&2; exit 1; }
+
+# Rows of one kind, as "name<TAB>spec". Comments and blank lines are dropped by
+# the NF test; BusyBox awk splits on whitespace, which is why the format has no
+# free-text column.
+registry_rows() { awk -v k="$1" '!/^#/ && NF >= 4 && $1 == k { print $2 "\t" $4 }' "$REGISTRY"; }
 
 KT=/opt/kafka/bin/kafka-topics.sh
 KB=/opt/kafka/bin/kafka-broker-api-versions.sh
@@ -55,32 +61,48 @@ probe="__pulse_infra_readiness_probe"
 "$KT" --bootstrap-server "$KAFKA_BOOTSTRAP" --delete --topic "$probe" >/dev/null 2>&1 || true
 log "topic creation verified"
 
-# ─── Topics ──────────────────────────────────────────────────────────────────
-for t in $TOPICS; do
+# ─── Topics, as registered ───────────────────────────────────────────────────
+# Replication factor and min ISR always come from the profile, never the row, so
+# one registry serves core/full (RF=3) and lite (RF=1) unchanged.
+topic_count=0
+while IFS="$(printf '\t')" read -r t spec; do
+  [ -n "$t" ] || continue
+  topic_count=$(( topic_count + 1 ))
+  parts="$TOPIC_PARTITIONS"
+  case "$spec" in partitions=*) parts="${spec#partitions=}" ;; esac
+
   if "$KT" --bootstrap-server "$KAFKA_BOOTSTRAP" --list | grep -qx "$t"; then
     log "topic ${t} already exists — leaving as is"
   else
     "$KT" --bootstrap-server "$KAFKA_BOOTSTRAP" --create \
           --topic "$t" \
-          --partitions "$TOPIC_PARTITIONS" \
+          --partitions "$parts" \
           --replication-factor "$TOPIC_REPLICATION_FACTOR" \
           --config "min.insync.replicas=${TOPIC_MIN_INSYNC_REPLICAS}" >/dev/null
-    log "created topic ${t} (partitions=${TOPIC_PARTITIONS} rf=${TOPIC_REPLICATION_FACTOR} min.isr=${TOPIC_MIN_INSYNC_REPLICAS})"
+    log "created topic ${t} (partitions=${parts} rf=${TOPIC_REPLICATION_FACTOR} min.isr=${TOPIC_MIN_INSYNC_REPLICAS})"
   fi
-done
+done <<EOF
+$(registry_rows topic)
+EOF
+[ "$topic_count" -gt 0 ] || fail "no topics registered in ${REGISTRY} — nothing to provision"
 
-# ─── Staging bucket ──────────────────────────────────────────────────────────
+# ─── Buckets, as registered ──────────────────────────────────────────────────
 # "staging", not "bronze": a transient landing pad with no retention promise.
-if wget -q -O- "${GCS_ENDPOINT}/storage/v1/b/${GCS_BUCKET}" >/dev/null 2>&1; then
-  log "bucket ${GCS_BUCKET} already exists — leaving as is"
-else
-  wget -q -O- \
-    --header 'Content-Type: application/json' \
-    --post-data "{\"name\":\"${GCS_BUCKET}\"}" \
-    "${GCS_ENDPOINT}/storage/v1/b?project=pulse-local" >/dev/null \
-    || fail "could not create bucket ${GCS_BUCKET} at ${GCS_ENDPOINT}"
-  log "created bucket ${GCS_BUCKET}"
-fi
+while IFS="$(printf '\t')" read -r b _spec; do
+  [ -n "$b" ] || continue
+  if wget -q -O- "${GCS_ENDPOINT}/storage/v1/b/${b}" >/dev/null 2>&1; then
+    log "bucket ${b} already exists — leaving as is"
+  else
+    wget -q -O- \
+      --header 'Content-Type: application/json' \
+      --post-data "{\"name\":\"${b}\"}" \
+      "${GCS_ENDPOINT}/storage/v1/b?project=pulse-local" >/dev/null \
+      || fail "could not create bucket ${b} at ${GCS_ENDPOINT}"
+    log "created bucket ${b}"
+  fi
+done <<EOF
+$(registry_rows bucket)
+EOF
 
 # Object paths are a convention, not pre-created directories. GCS has no real
 # directories; the ingestor writes the full object name:

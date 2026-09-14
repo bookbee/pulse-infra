@@ -1,9 +1,15 @@
 # pulse-infra
 
-Local development infrastructure for the Pulse platform: Kafka, Redis, a GCS
-stand-in, and `pulse-gateway`, brought up with one command so every other Pulse
-repo can be developed, run and integrated **entirely on a laptop before anything
-is committed to Git**.
+Local development infrastructure for the Pulse platform: Kafka, Redis and a GCS
+stand-in, brought up with one command so every other Pulse repo can be
+developed, run and integrated **entirely on a laptop before anything is
+committed to Git**.
+
+**This repo provides backing services and nothing else.** It does not build,
+start, configure or test any other Pulse project — they run their own containers
+and connect in. What gets provisioned comes from
+[`registry/dependencies.tsv`](registry/dependencies.tsv), where each project
+registers the topics, buckets, Redis keys and ports it needs.
 
 > ## Scope: local development only
 >
@@ -17,12 +23,12 @@ is committed to Git**.
 
 ## Quickstart
 
-Requires Docker (Compose v2), `make`, and — for the `full` profile only — the
-sibling repo `../pulse-gateway` checked out.
+Requires Docker (Compose v2) and `make`. No sibling repo needs to be checked
+out: nothing here builds another project's code.
 
 ```bash
 make up          # cold start from nothing, full profile
-make verify      # prove the contract: 17 checks, real output
+make verify      # prove the contract: 14 checks, real output
 make down        # stop, keep data
 make reset       # wipe this stack's volumes, back to known-clean
 ```
@@ -37,34 +43,36 @@ What you get on `full`:
 | Kafka (in-network) | `kafka-1:9092,kafka-2:9092,kafka-3:9092` |
 | Redis | `localhost:6379`, password `pulse-local-not-a-secret` |
 | GCS staging | `http://localhost:4443`, bucket `pulse-staging-local` |
-| Gateway | `http://localhost:8080` |
 
-Topics `ingestion-events`, `ingestion-signals`, `ingestion-logs` — 6 partitions,
-RF=3. Full interface details, including the auth headers that are easy to get
-wrong, are in [`docs/stack-contract.md`](docs/stack-contract.md).
+Use the host addresses for a process on your laptop and the in-network ones from
+a container. Topics `ingestion-events`, `ingestion-signals`, `ingestion-logs` —
+6 partitions, RF=3, provisioned from
+[`registry/dependencies.tsv`](registry/dependencies.tsv). Full interface details
+are in [`docs/stack-contract.md`](docs/stack-contract.md).
 
-Send an event end to end:
+Check it is really up:
 
 ```bash
-curl -X POST http://localhost:8080/telemetry/events/v1 \
-  -H 'Content-Type: application/json' \
-  -H 'x-client-id: pulse_infra_smoke' \
-  -H 'x-api-key: local-not-a-secret-smoke-key' \
-  -d '{"event_id":"01JEXAMPLE","timestamp":"2026-01-01T00:00:00.000Z",
-       "type":"track","event":"demo","user":{"user_id":"u1"},
-       "context":{"app":{"name":"demo","version":"1.0.0"}}}'
-# -> 202 {"status":"accepted"}
+make verify      # 14 checks, real output
 
-docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
-  XLEN ingestion-events
+# or by hand:
+docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning PING
+make topics      # every registered topic, with partitions and ISR
+make buckets
 ```
+
+To run a service against it, join this stack's network from your own compose
+file — see **Containerizing a consumer** in
+[`docs/stack-contract.md`](docs/stack-contract.md). Nothing needs to be added
+here for that; if your service needs a topic, key or port, register it in
+`registry/dependencies.tsv`.
 
 ## Profiles
 
 | Profile | Contents | Purpose | Measured idle footprint |
 |---|---|---|---|
 | `core` | 3-broker Kafka + fake-gcs | the ingestor's world | **~1.01 GB**, ~0.2 CPU |
-| `full` | everything: Kafka + Redis + fake-gcs + gateway | end-to-end local runs | **~1.03 GB**, ~0.3 CPU |
+| `full` | every backing service: Kafka + Redis + fake-gcs | what consumers connect to | **~1.03 GB**, ~0.3 CPU |
 | `lite` | single-broker Kafka + fake-gcs | low-resource fallback | **~0.33 GB**, ~0.1 CPU |
 
 ```bash
@@ -75,9 +83,9 @@ make up PROFILE=lite
 Measured on Apple Silicon (arm64), Docker 29.7.2, 8 CPUs / 8.2 GB available to
 Docker, idle after a ~40s settle. Per-broker steady state is ~330 MB with a
 512 MB JVM heap cap, so **the three brokers are essentially the entire
-footprint** — Redis, fake-gcs and the gateway are ~10–16 MB each. `full` needs
-about 1 GB, not 8; the ceiling you will actually hit is CPU during a heavy
-produce, not memory.
+footprint** — Redis and fake-gcs are ~10–16 MB each. `full` needs about 1 GB,
+not 8; the ceiling you will actually hit is CPU during a heavy produce, not
+memory. Consumers you run alongside cost whatever they cost, on top of this.
 
 **Kafka runs as a multi-broker cluster by default**, because a single broker
 cannot exercise consumer-group rebalancing or ISR behaviour — exactly the
@@ -134,11 +142,9 @@ The bump procedure is deliberate and documented at the top of `images.lock`:
 resolve, edit `images.lock` **and** `compose/compose.yaml` together, then
 `make reset && make up && make verify`.
 
-The one exception is the gateway, which is built from source at
-`../pulse-gateway` using that repo's own `Dockerfile` — so its bytes follow
-whatever commit is checked out there. Same recipe as CI or any other consumer of
-that image, which is the point of it living in the gateway repo rather than
-here.
+There is no exception any more: this stack builds nothing, so every byte it runs
+is digest-pinned. A consumer you run alongside is reproducible to the extent its
+own repo makes it so — which is that repo's problem to state, not this one's.
 
 ## Verification
 
@@ -150,28 +156,30 @@ observed, not just pass/fail:
 3. Write an object at the agreed path; read the same bytes back; list the bucket
 4. Stop a broker; produce with `acks=all` and read back from the degraded
    cluster; show the under-replicated partitions; restart the broker
-5. Gateway ingest via API key **and** via a minted JWT; confirm both land in the
-   Redis stream and that only the JWT envelope carries `event_header`
+5. Redis itself: refuse an unauthenticated client, round-trip a stream
+   (`XADD`/`XRANGE`) and a list (`RPUSH`/`LRANGE`), and confirm
+   `maxmemory-policy` is still `noeviction`
 6. Read the Ports table in `docs/stack-contract.md` and probe every row: an
    address marked `live` that does not answer **fails the suite**, and a row
    marked `contracted-not-yet-listening` that *does* answer is reported as drift
-7. Fill `ingestion-logs` to its cap to induce a real delivery failure, then
-   confirm the refused payload is retained whole in `ingestion-dlq` with
-   `error_reason=logs_list_full` — not dropped. Restores the list depth after
+7. Read `registry/dependencies.tsv` and confirm every registered topic and
+   bucket actually exists in the running stack
 
-Check 7 is the only check that mutates state, which is why it runs last. It
-fails rather than skips if a running gateway has no `REDIS_LIST_DLQ`: that means
-the image is older than the config it was started with, which is drift this
-suite exists to catch.
+**No check drives another project.** Proving that a gateway or an ingestor
+behaves correctly is that repo's suite, not this one — a check here that needed
+a consumer running would be the coupling this layout exists to prevent. What
+this suite proves is that the backing services work and that what was registered
+was provisioned.
 
 Cold start, reset and reproducibility are lifecycle operations rather than
 suite checks — `make reset && make up` twice, which the table above documents.
 
-Check 6 is what keeps the contract page honest: the table four other repos
-resolve addresses from is now machine-checked against the stack it claims to
-describe, in both directions. Rows that are deliberately not live — `internal`,
-`live (lite)`, `contracted-not-yet-listening` — are skipped **with their reason
-printed**, never silently.
+Checks 6 and 7 are what keep the paperwork honest, from both ends. Check 6
+machine-checks the Ports table four other repos resolve addresses from, in both
+directions — rows deliberately not live (`internal`, `live (lite)`, `external`,
+`contracted-not-yet-listening`) are skipped **with their reason printed**, never
+silently. Check 7 does the same for the registry: a row added but never
+provisioned is an interface that exists on paper and not in the stack.
 
 ## Troubleshooting
 
@@ -180,24 +188,22 @@ Failure modes actually hit while building this, in rough order of likelihood:
 **`Cannot connect to the Docker daemon`** — Docker Desktop isn't running.
 `open -a Docker`, wait for it, retry.
 
-**Gateway returns `401 {"error":"unauthorized"}`** — API-key auth needs **two**
-headers: `x-api-key` *and* `x-client-id`. The client id keys the store, so a
-request with only the key is a flat 401 with an empty `client_id` in the gateway
-log. This is not documented in the gateway repo. If you sent both an API key and
-an `Authorization` header, that is also a 401 — ambiguous identity, by design.
+**Your containerized service cannot reach `kafka-1` / `redis` / `fake-gcs`** —
+almost always one of two things. Either it is not on this stack's network (join
+`pulse-infra` as an `external` network — see "Containerizing a consumer" in the
+stack contract), or it is still using **host** addresses. Every consumer repo's
+`.env.example` ships `localhost:…` because it is written for a laptop process;
+inside a container `localhost` is the container itself, so you get connection
+refused rather than an error that points at the cause.
 
-**Gateway returns `400` listing required fields** — the event schema is stricter
-than it looks: `event_id`, `timestamp`, `type` and `event` are all required,
-`user` needs at least one of `user_id`/`anonymous_id`/`device_id`, and `context`
-needs at least one populated field anywhere inside it. Validation failures are
-`400`, not `422`. The quickstart payload above is a valid minimum.
+**Your service starts before topics exist** — bring this stack up first. `make
+up` does not return until bootstrap has exited 0, so every registered topic and
+bucket is present when it does. Nothing here waits on you.
 
-**Gateway logs `no .env file found, reading from environment`** — expected and
-harmless in a container. Config comes from `compose/gateway.env`; the gateway
-looks for a `.env` in its working directory first and warns when there isn't one.
-
-**Gateway build fails** — `../pulse-gateway` must be checked out next to this
-repo. Only the `full` profile needs it; `core` and `lite` don't build it at all.
+**Something you registered was never created** — `make verify` check 7 names it.
+Re-run `make up`; if it is still missing, `docker logs pulse-bootstrap` will say
+why. A row added to `registry/dependencies.tsv` after the stack was already up
+is not provisioned until the next `make up`.
 
 **`Bind for 0.0.0.0:19092 failed: port is already allocated`** — either `lite`
 and `core`/`full` are both up (they share 19092), or something else on the
@@ -222,19 +228,21 @@ pulse-infra/
 ├── Makefile                           lifecycle: up / down / reset, inspection, verify
 ├── images.lock                        pinned digests + resolution date + bump procedure
 ├── compose/
-│   ├── compose.yaml                   all services, three profiles, health gates
-│   └── gateway.env                    all 47 gateway config vars (local fixtures)
+│   └── compose.yaml                   backing services only, three profiles, health gates
+├── registry/
+│   └── dependencies.tsv               what each project registered: topics, buckets, keys, ports
 ├── bootstrap/
-│   ├── bootstrap.sh                   readiness gates, topics, bucket (idempotent)
-│   ├── verify.sh                      the 17-check verification suite
-│   ├── resolve-digests.sh             digest drift report
-│   ├── mint-dev-jwt.sh                generate a local HS256 token
-│   └── fixtures/
-│       └── api_keys.local.json        obviously-fake gateway auth fixtures
+│   ├── bootstrap.sh                   readiness gates, then provisions what is registered
+│   ├── verify.sh                      the 14-check verification suite
+│   └── resolve-digests.sh             digest drift report
 └── docs/
     ├── stack-contract.md              the interface four-plus repos code against
     └── divergences.md                 where local lies to you
 ```
+
+No consumer's config, credentials or build lives here. If you are looking for
+the gateway's env file or auth fixtures, they moved to `pulse-gateway` — this
+stack no longer runs it.
 
 ## Extension point: Iceberg silver
 

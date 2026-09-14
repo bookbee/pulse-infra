@@ -1,0 +1,62 @@
+# pulse-infra dependency registry
+#
+# THE DIRECTION OF THIS FILE IS THE POINT. pulse-infra provides backing services
+# and nothing else: it does not build, start, configure or test another repo's
+# code. Projects that need infrastructure REGISTER it here, and this stack
+# provisions it. Nothing in this repo reaches back into a consumer.
+#
+# To register a dependency: add a row, open a PR against pulse-infra. Adding a
+# row is a stack-contract change — see "Changing this contract" in
+# docs/stack-contract.md. The row and the code that uses it land together.
+#
+# Columns are whitespace-separated. Four fields, all required, no free text:
+#
+#   kind       what is being registered (see below)
+#   name       the topic / bucket / key / port number
+#   owner      project(s) that break if it is missing; comma-separated, no spaces
+#   spec       kind-specific; "-" means "stack defaults"
+#
+# Kinds, and what this stack does with each:
+#
+#   topic      PROVISIONED by bootstrap/bootstrap.sh at `make up`.
+#              spec: partitions=N to override, or "-" for TOPIC_PARTITIONS.
+#              Replication factor and min ISR always come from the profile, so
+#              the same row works on core/full (RF=3) and lite (RF=1).
+#   bucket     PROVISIONED by bootstrap. spec is always "-".
+#   redis-key  DECLARED only. Redis keys spring into being on first write, so
+#              there is nothing to create; the row records who writes it and
+#              stops two projects colliding on a name. spec: stream | list.
+#   port       RESERVED only. This stack does not run the listener — the owner
+#              does. The row exists so port numbers cannot be handed out twice,
+#              which is how 9090 was known to be free. spec: the protocol.
+#
+# Provisioning is idempotent: a topic or bucket that already exists is left
+# exactly as it is, never recreated or reconfigured.
+#
+# kind       name                  owner                          spec
+
+# ─── Kafka topics ────────────────────────────────────────────────────────────
+# Names deliberately mirror the Redis key names below, so one vocabulary covers
+# both transports. 6 partitions divides evenly by 1, 2, 3 and 6 consumers, so
+# consumer-group rebalancing is observable at every group size worth trying.
+topic        ingestion-events      pulse-ingestor,pulse-gateway   partitions=6
+topic        ingestion-signals     pulse-ingestor,pulse-gateway   partitions=6
+topic        ingestion-logs        pulse-ingestor,pulse-gateway   partitions=6
+
+# ─── Object storage ──────────────────────────────────────────────────────────
+# "staging", not "bronze": a transient landing pad with no retention promise.
+# Object paths are a convention, not pre-created directories — GCS has none.
+bucket       pulse-staging-local   pulse-ingestor                 -
+
+# ─── Redis keys ──────────────────────────────────────────────────────────────
+# Declared, not created. Structure is the owner's contract with its consumers;
+# this stack only guarantees a Redis that honours it.
+redis-key    ingestion-events      pulse-gateway                  stream
+redis-key    ingestion-signals     pulse-gateway                  stream
+redis-key    ingestion-logs        pulse-gateway                  list
+redis-key    ingestion-dlq         pulse-gateway                  list
+
+# ─── Port reservations ───────────────────────────────────────────────────────
+# Reserved, not served. The owner runs the listener in its own compose file.
+port         8080                  pulse-gateway                  http
+port         9090                  pulse-gateway                  grpc

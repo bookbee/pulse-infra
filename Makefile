@@ -42,15 +42,16 @@ help:
 # ─── Lifecycle ───────────────────────────────────────────────────────────────
 
 # `docker compose up --wait` treats a one-shot container as satisfied the moment
-# it is running, NOT when it exits 0 — so on the core and lite profiles it would
-# return while topics and the bucket are still being created, and a consumer
-# starting immediately would race the bootstrap. Only `full` is implicitly safe
-# (the gateway depends on bootstrap completing). So block on it explicitly.
-# --build is deliberate: compose only builds when the image tag is ABSENT, so
-# without it an edit to ../pulse-gateway is silently ignored and you debug a
-# stale binary. Layer caching makes the no-change case near-instant.
+# it is running, NOT when it exits 0 — so it would return while topics and the
+# bucket are still being created, and a consumer starting immediately would race
+# the bootstrap. Nothing here depends on bootstrap completing any more (this
+# stack runs no consumers), so the explicit wait is the ONLY thing standing
+# between `make up` returning and the contract actually existing. Don't drop it.
+#
+# There is no --build: this stack builds nothing. Every image is digest-pinned
+# from images.lock. Consumer projects build their own.
 up:
-	$(DC) up -d --wait --build
+	$(DC) up -d --wait
 	@code=$$(docker wait $(BOOTSTRAP_SVC) 2>/dev/null | tail -1); \
 	 if [ -z "$$code" ]; then \
 	   echo "WARNING: bootstrap container $(BOOTSTRAP_SVC) not found — contract unverified"; \

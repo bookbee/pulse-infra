@@ -23,68 +23,59 @@ Classes of bug that pass locally and fail later:
 - Retry logic that treats an auth failure as retryable and hammers the API.
 - Anything depending on TLS: cert pinning, proxy behaviour, handshake timeouts.
 
-## The gateway does not write Kafka
+## Nothing in this stack produces data
 
-The platform diagram shows `pulse-gateway → Kafka`. That edge **does not exist in
-the gateway at this commit** — `internal/queue/` contains only a Redis producer,
-and `QUEUE_BACKEND=redis` is the only backend that resolves. Kafka appears in
-one doc comment as a future implementation.
+Topics and buckets are provisioned and then left **empty**. Redis keys are not
+even created — they appear on first write, and this stack never writes. Every
+byte that flows locally is put there by a consumer you started yourself, or by a
+verification check that cleans up after itself.
 
-Consequence: **no local run exercises dual-write divergence**, because there is
-only one write path. When the gateway gains a Kafka producer, the interesting
-failure — Redis accepted and Kafka didn't, or vice versa, leaving the two paths
-disagreeing — becomes possible for the first time, and nothing in this stack's
-history will have tested it. Kafka is provisioned here and fed by
-`pulse-ingestor`'s own tests and `pulse-client`, not by the gateway.
+Consequence: **a green `make up` proves the plumbing exists, not that anything
+flows through it.** The producers are elsewhere and, at their current commits,
+partly unwritten — `pulse-gateway` has no Kafka producer at all, so the
+`ingestion-*` topics have never been fed by the thing the platform diagram says
+feeds them. The first real dual-write divergence (Redis accepted, Kafka didn't,
+or the reverse) becomes possible only when that lands, and nothing in this
+stack's history will have tested it.
 
-## The gateway has no gRPC listener
+Track producer status in the producing repo. This page only promises that the
+destination exists and behaves.
 
-Not "no gRPC endpoint" — the distinction matters for what you can plan against.
-The surface is **specified and ratified**: `pulse-gateway`'s `ADR-009` puts three
-unary RPCs on their own port, 9090, beside Fiber (Fiber is `fasthttp` and cannot
-serve `grpc-go` on one listener; `cmux` and Connect were considered and
-rejected), and `GRPC-001`…`GRPC-011` pin the semantics down to status-code
-mapping, metadata-carried credentials and byte-identical envelope parity with
-HTTP. The address is carried here — Ports table in
-[`stack-contract.md`](stack-contract.md), status
-`contracted-not-yet-listening`.
+## Reserved ports are not served ports
 
-What does not exist is the server. Every `GRPC-*` requirement is `MISS` at the
-gateway's current commit: no `grpc-go` dependency, no listener, and nothing bound
-to 9090 in this stack (the host port is not published either — that section says
-why).
+`gateway:8080` and `gateway:9090` appear in the Ports table with status
+`external`. That means the numbers are **allocated so nothing else takes them**,
+not that anything answers. This stack does not run those listeners.
 
-Consequence: **`pulse-client`'s gRPC leg cannot run locally at all** — not
-partially, not with gaps; there is nothing to connect to. That includes the
-HTTP/gRPC parity suite, which is the *external* check on the cost `ADR-009`
-knowingly accepted: auth, allowlist, rate limiting, size caps, metrics and
-request logging each get a second implementation on the gRPC side, and nothing
-local can currently catch the two drifting apart. A green local run says nothing
-whatsoever about the gRPC transport, and will not until the listener lands.
+9090 is the sharper case: `pulse-gateway`'s `ADR-009` ratified a gRPC transport
+there, and every `GRPC-*` requirement is `MISS` at its current commit. So the
+address is stable and safe to code against, and a connection to it fails.
+`pulse-client` is specified to drive HTTP **and** gRPC; locally it can drive
+neither unless you start the gateway yourself from its repo, and the gRPC leg
+not even then.
 
-## Redis stream loss is silent, and local caps are tighter
+## Redis: no backpressure, and local caps are tighter
 
-Neither Redis destination applies backpressure to the gateway, but as of
-2026-09-14 they no longer lose data the same way:
+Redis here is a real Redis with `maxmemory 512mb` and `maxmemory-policy
+noeviction`, so a write that cannot be served **fails loudly** rather than
+silently evicting someone's key. That much is this stack's promise and `make
+verify` check 5 asserts it.
 
-- **Streams still shed silently.** `MAXLEN` (approximate) trimming plus the
-  30-minute `XTRIM MINID` age trim both discard entries a consumer never read,
-  and nothing records that it happened. This is still real, unrecoverable loss.
-- **The log list no longer does.** A write refused by the Lua cap
-  (`LOGS_LIST_FULL`) is dead-lettered to `ingestion-dlq` with
-  `error_reason=logs_list_full` rather than dropped (gateway `P2-C` C-1), so it
-  is recoverable by a deliberate operator replay. `make verify` check 7 induces
-  exactly this failure and asserts the envelope survives it.
+Everything past that is the writer's design, not ours: trimming, retention,
+caps, what gets dead-lettered and what is dropped. Two things are worth carrying
+anyway, because they shape any consumer built here:
 
-So "Redis loses data under lag" is now only true of the streams. Do not carry
-the old assumption into consumer design: a lost *log* is a triage problem, a
-lost *stream entry* is gone.
+- **Nothing applies backpressure.** A slow consumer does not slow a producer
+  down; it just falls behind. **Consumer lag is the metric that matters**, in
+  both local and production.
+- **Local caps are deliberately small** — the registered writers use ~10k here
+  against ~100k in their own example configs, so the lossy path shows up on a
+  laptop instead of in the dev environment. The *absolute* numbers therefore
+  mean nothing for capacity planning.
 
-Local caps are **10k**; the gateway's own example config uses **100k**, and a
-real deployment would be larger still. So local runs hit the lossy path **sooner
-than production would** — deliberately, so you see it here. The flip side: the
-*absolute* numbers mean nothing for capacity planning. Consumer lag is the metric
-that matters in both places.
+Whether a given overflow is recoverable is the writer's contract with its
+readers — for the `ingestion-*` keys, see `pulse-gateway`. Do not assume from
+this page that a dropped record is gone, or that it is kept.
 
 ## No failure injection of any kind
 
@@ -134,12 +125,15 @@ like production, where the delay batches joining members.
 **No broker authentication or encryption locally.** Every listener is
 PLAINTEXT. Nothing about the SASL/TLS path is exercised.
 
-## The gateway image is not reproducible
+## Consumer images are not this stack's problem — or its guarantee
 
-Every other image is digest-pinned. The gateway is **built from whatever commit
-is checked out in `../pulse-gateway`**. It now builds from that repo's own
-`Dockerfile`, so the *recipe* is shared with CI and any other consumer — but the
-*source* still follows the sibling checkout. Two laptops on different gateway
-commits run different gateways while both report a clean stack. Closing that
-means publishing tagged gateway images and pinning one here, which is a decision
-for when the gateway has a release process.
+Every image **this stack runs** is digest-pinned in `images.lock`, multi-arch,
+and bumped only deliberately. Since 2026-09-14 nothing here is built from
+source, so there is no "except the gateway" caveat any more: what you run is
+what the lockfile says.
+
+That guarantee stops at the network boundary. A consumer you start alongside is
+reproducible only to the extent its own repo makes it so, and two laptops
+running different consumer commits will both report a perfectly clean stack
+here — because from this side they are indistinguishable. **A green run here
+says nothing about which version of anything else you are running.**

@@ -12,7 +12,7 @@ covers only what they don't.
 ```bash
 make up                  # cold start, full profile (~25s warm, ~80s first build)
 make up PROFILE=core     # or lite
-make verify              # 17 checks against a live full stack
+make verify              # 14 checks against a live full stack
 make down                # stop, keep data
 make reset               # delete this stack's volumes only
 make digests             # digest drift report; writes nothing
@@ -20,11 +20,12 @@ make digests             # digest drift report; writes nothing
 
 There are no unit tests and no linter here — the artifact is a running stack, so
 `make verify` is the test suite. It needs the `full` profile up; checks 2–4 work
-on `core`, and checks 5–7 self-skip what the running profile doesn't have.
-Check 7 is the only destructive one — it fills `ingestion-logs` to its cap to
-induce a real delivery failure, then restores the depth it found.
-Check 6 parses the Ports table out of `docs/stack-contract.md` and probes it, so
-**that table is executable**: mark a row `live` and it must answer.
+on `core`, and check 5 self-skips without Redis. **No check drives another
+project** — if a check would need a consumer running, it belongs in that repo.
+Checks 6 and 7 make the paperwork executable: 6 parses the Ports table out of
+`docs/stack-contract.md` and probes it (mark a row `live` and it must answer),
+7 reads `registry/dependencies.tsv` and asserts every registered topic and
+bucket exists.
 
 ## Scope boundary — hold it
 
@@ -32,8 +33,22 @@ Check 6 parses the Ports table out of `docs/stack-contract.md` and probes it, so
 toward production scope by default, and the README's scope statement is load
 bearing: no IAM, no TLS, fake credentials on purpose, disposable data. Silver /
 Iceberg is deliberately out of the local loop — there is a marked extension
-point in `compose/compose.yaml` and nothing built behind it. Adding a component
-to `full` taxes every end-to-end run, so new services get their own profile.
+point in `compose/compose.yaml` and nothing built behind it.
+
+**Backing services only — this is the boundary that matters most.** This repo
+provides Kafka, Redis and object storage. It does **not** build, start,
+configure, health-check or test any other Pulse project. The dependency arrow
+points one way: consumers register what they need in
+`registry/dependencies.tsv` and run their own containers against the addresses
+in the contract.
+
+The pressure is always toward the opposite. Adding a consumer to `compose.yaml`
+is a two-line change that feels helpful and costs: this stack then builds their
+code, holds their config, breaks when their build breaks, and its test suite
+starts asserting their behaviour. That is exactly what was unwound on
+2026-09-14, when the gateway service, its 57-var env file and its auth fixtures
+were removed from here. **Do not add a consumer service back.** If someone needs
+one running, they run it from their repo on the `pulse-infra` network.
 
 ## Where the real complexity is
 
@@ -56,27 +71,20 @@ to `full` taxes every end-to-end run, so new services get their own profile.
 
 ## Gotchas verified against the running stack
 
-- **API-key auth on the gateway needs TWO headers**: `x-api-key` *and*
-  `x-client-id`. The client id keys the store; key-only is a flat 401. Not
-  documented in the gateway repo — found by hitting it.
-- **`event_header` is on the Redis envelope for JWT requests and absent for
-  API-key ones.** Contract, not a bug. Consumers treat it as optional.
-- **The event schema is stricter than it looks**: `event_id`, `timestamp`,
-  `type`, `event` all required, `user` needs one of three id fields, `context`
-  needs at least one populated field anywhere inside it. Failures are `400`.
-- **The gateway needs all 57 env vars** (`compose/gateway.env`) — it has no
-  defaults and aborts listing every missing one. The count grows with the
-  gateway: `SAFE_BUFFER_THRESHOLD` was inert until its `T-1.3` and is now
-  **required and validated** in `(0,1]`, and `T-1.2`/`DEL-012` added the DLQ and
-  stream-retention keys. Re-check the count against `internal/config` rather
-  than trusting this number after a gateway bump.
-- **The gateway has no Kafka producer and no gRPC listener** at its current
-  commit, despite the platform diagram and `pulse-client`'s README. Both are
-  *specified* upstream and neither is built — gRPC in `ADR-009` and
-  `GRPC-001`…`GRPC-011`, all `MISS`. Say "no listener", not "no endpoint": the
-  gRPC address is real contract (`gateway:9090`, status
-  `contracted-not-yet-listening`) and `pulse-client` resolves it from our Ports
-  table. Kafka here is provisioned for `pulse-ingestor`, not fed by the gateway.
+- **Consumers' in-network vs host addresses are the first thing that breaks.**
+  Every consumer `.env.example` ships `localhost:…`; inside a container that is
+  the container itself, so the symptom is connection-refused, not a name error.
+  The Ports table's two columns exist for exactly this.
+- **No consumer's config lives here any more.** `compose/gateway.env`, the API
+  key fixtures and `mint-dev-jwt.sh` were removed on 2026-09-14 and belong to
+  `pulse-gateway`. Do not accept them back: the moment this repo holds another
+  project's tuning, it starts failing when their build breaks.
+- **Nothing in this stack produces to Kafka or Redis.** Topics and keys are
+  provisioned/reserved and left empty; their registered writers fill them from
+  their own repos. `pulse-gateway` has no Kafka producer and no gRPC listener at
+  its current commit (gRPC is specified in its `ADR-009` / `GRPC-001`…`011`, all
+  `MISS`), but that is now *their* status to track, not ours — we only hold the
+  port reservations.
 - **The Kafka image has `bash` and BusyBox `wget`, but no `curl`.** Bucket
   creation uses `wget --post-data`.
 - **`lite` and `core`/`full` share host port 19092** and cannot run together.
@@ -102,8 +110,8 @@ to `full` taxes every end-to-end run, so new services get their own profile.
   `contracted-not-yet-listening`; it is not left off the page. Publishing the
   host port and flipping that row to `live` are one change, and `make verify`
   check 6 enforces both directions. See "Changing this contract".
-- Credential fixtures stay obviously fake and are named to prove it
-  (`local-not-a-secret-*`). JWTs are generated by `bootstrap/mint-dev-jwt.sh`,
-  never checked in.
+- Credential fixtures that remain (the Redis password) stay obviously fake and
+  are named to prove it (`local-not-a-secret-*`). No consumer's credentials
+  live here.
 - New troubleshooting entries in the README come from failures actually hit, not
   anticipated ones.

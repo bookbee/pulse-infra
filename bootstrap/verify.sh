@@ -8,9 +8,13 @@
 #   2 create a topic; produce and consume a message
 #   3 write an object to the bucket at the agreed path; read it back
 #   4 kill one broker; confirm the cluster stays writable
-#   5 gateway accepts a telemetry event and it lands in Redis
+#   5 Redis honours its contract: auth, both structures, noeviction
 #   6 every port the stack contract marks `live` actually answers
-#   7 an undeliverable payload is retained in the DLQ, not lost
+#   7 everything in the dependency registry is actually provisioned
+#
+# NOTHING HERE DRIVES A CONSUMER. This stack provides backing services; proving
+# that a gateway or an ingestor behaves correctly is that repo's suite, not this
+# one. If a check needs another project running, it does not belong here.
 #
 # Cold start, reset, and reproducibility (brief steps 1, 5, 6) are lifecycle
 # operations driven from the Makefile — see README "Verification".
@@ -115,58 +119,57 @@ echo "  restarting pulse-kafka-3"
 docker start pulse-kafka-3 >/dev/null 2>&1
 kexec /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --delete --topic "$T2" >/dev/null 2>&1 || true
 
-# ─── 5. gateway → Redis ──────────────────────────────────────────────────────
-head_ "5. Gateway ingest lands in Redis"
-if [ -n "$(docker ps -q -f name=pulse-gateway)" ]; then
-  # API-key auth needs BOTH x-api-key AND x-client-id: the client id keys the
-  # store, and a missing one is a flat 401. See docs/stack-contract.md.
-  EVENT='{"event_id":"01JVERIFY000000000000001","timestamp":"2026-01-01T00:00:00.000Z","type":"track","event":"pulse_infra_verify","user":{"user_id":"verify-user"},"context":{"app":{"name":"pulse-infra-verify","version":"1.0.0"}},"properties":{"source":"pulse-infra-verify"}}'
-  before=$(docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
-             XLEN ingestion-events 2>/dev/null | tr -d '\r')
-  code=$(curl -s -o /tmp/pulse-verify-resp -w '%{http_code}' \
-    -X POST http://localhost:8080/telemetry/events/v1 \
-    -H 'Content-Type: application/json' \
-    -H 'x-client-id: pulse_infra_smoke' \
-    -H 'x-api-key: local-not-a-secret-smoke-key' \
-    -d "$EVENT" 2>/dev/null)
-  echo "  POST /telemetry/events/v1 (api key) -> HTTP $code"
-  echo "  response: $(cat /tmp/pulse-verify-resp 2>/dev/null | head -c 200)"
-  if [ "$code" = "202" ]; then ok "gateway accepted the event (api key)"; else no "gateway returned $code (expected 202)"; fi
-
-  # JWT path: same event, and the envelope should now carry event_header.
-  TOKEN=$(./bootstrap/mint-dev-jwt.sh 600 pulse-infra-verify 2>/dev/null)
-  jcode=$(curl -s -o /tmp/pulse-verify-jwt -w '%{http_code}' \
-    -X POST http://localhost:8080/telemetry/events/v1 \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer ${TOKEN}" \
-    -d "$EVENT" 2>/dev/null)
-  echo "  POST /telemetry/events/v1 (jwt)     -> HTTP $jcode"
-  if [ "$jcode" = "202" ]; then ok "gateway accepted the event (minted JWT)"; else no "JWT request returned $jcode (expected 202)"; fi
-  sleep 1
-  depth=$(docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
-            XLEN ingestion-events 2>/dev/null | tr -d '\r')
-  echo "  XLEN ingestion-events: ${before:-0} -> ${depth:-<none>}"
-  if [ "$(( ${depth:-0} - ${before:-0} ))" -ge 2 ]; then
-    ok "both events landed in the Redis stream"
-  else
-    no "expected 2 new entries in ingestion-events, saw $(( ${depth:-0} - ${before:-0} ))"
-  fi
-
-  # event_header is populated for JWT requests and ABSENT for api-key ones.
-  # That asymmetry is contract, not a bug — see docs/stack-contract.md.
-  newest=$(docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
-             XREVRANGE ingestion-events + - COUNT 2 2>/dev/null)
-  if printf '%s' "$newest" | grep -q 'event_header'; then
-    ok "JWT envelope carries event_header"
-  else
-    no "no event_header on the JWT envelope"
-  fi
-  echo "  --- newest stream entry ---"
-  printf '%s\n' "$newest" | sed 's/^/  /' | head -8
-  echo "  --- gateway readiness ---"
-  curl -s http://localhost:8080/readyz | sed 's/^/  /'; echo
+# ─── 5. Redis works as promised ──────────────────────────────────────────────
+# This stack PROVIDES Redis; it does not own what any project writes into it.
+# So this check exercises Redis itself against the guarantees the contract makes
+# — auth, both structures registered against it, and the noeviction policy that
+# consumers' error models depend on. It never drives a consumer's API.
+head_ "5. Redis honours the contract"
+if [ -z "$(docker ps -q -f name=pulse-redis)" ]; then
+  echo "  redis not running (profile core/lite) — skipping"
 else
-  echo "  gateway not running (profile core/lite) — skipping"
+  R="docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning"
+
+  # Auth is contract: an unauthenticated client must be refused, not served.
+  if docker exec pulse-redis redis-cli PING 2>&1 | grep -qi 'NOAUTH\|auth'; then
+    ok "unauthenticated clients are refused (requirepass in force)"
+  else
+    no "Redis answered an unauthenticated PING — requirepass is not in force"
+  fi
+
+  # A stream, the structure registered for events/signals.
+  SK="__pulse_infra_verify_stream"
+  $R DEL "$SK" >/dev/null 2>&1
+  $R XADD "$SK" '*' data '{"probe":"pulse-infra-verify"}' >/dev/null 2>&1
+  if [ "$($R XLEN "$SK" 2>/dev/null | tr -d '\r')" = "1" ] &&
+     $R XRANGE "$SK" - + 2>/dev/null | grep -q 'pulse-infra-verify'; then
+    ok "stream XADD/XRANGE round-trips a one-field \`data\` entry"
+  else
+    no "stream round-trip failed on $SK"
+  fi
+  $R DEL "$SK" >/dev/null 2>&1
+
+  # A list, the structure registered for logs/dlq.
+  LK="__pulse_infra_verify_list"
+  $R DEL "$LK" >/dev/null 2>&1
+  $R RPUSH "$LK" '{"probe":"pulse-infra-verify"}' >/dev/null 2>&1
+  if $R LRANGE "$LK" 0 -1 2>/dev/null | grep -q 'pulse-infra-verify'; then
+    ok "list RPUSH/LRANGE round-trips an entry"
+  else
+    no "list round-trip failed on $LK"
+  fi
+  $R DEL "$LK" >/dev/null 2>&1
+
+  # noeviction is the load-bearing one: consumers are promised that a write
+  # fails loudly rather than a key being evicted from under them.
+  pol=$($R CONFIG GET maxmemory-policy 2>/dev/null | tr -d '\r' | tail -1)
+  mem=$($R CONFIG GET maxmemory 2>/dev/null | tr -d '\r' | tail -1)
+  echo "  maxmemory=$mem maxmemory-policy=$pol"
+  if [ "$pol" = "noeviction" ]; then
+    ok "maxmemory-policy is noeviction — writes fail loudly, keys are not evicted"
+  else
+    no "maxmemory-policy is '$pol', not noeviction — consumers' error model is broken"
+  fi
 fi
 
 # ─── 6. contract ports match reality ─────────────────────────────────────────
@@ -176,6 +179,9 @@ fi
 #
 #   live                          must answer, or the suite FAILS
 #   live (lite) / internal        skipped, with the reason printed
+#   external                      another project's listener. This stack only
+#                                 reserves the number; probing it would be
+#                                 testing someone else's service, so we don't
 #   contracted-not-yet-listening  skipped, but if it DOES answer that is
 #                                 reported as drift — the listener landed and
 #                                 the row was never flipped to `live`
@@ -220,6 +226,7 @@ else
   targets=""
   while IFS="$TAB" read -r svc net host st; do
     [ -n "$svc" ] || continue
+    # `external` is deliberately absent here: not ours to probe.
     case "$st" in live|"live (lite)"|contracted-not-yet-listening) ;; *) continue ;; esac
     case "$net" in *:*) ;; *) continue ;; esac
     case "$running" in *" ${net%%:*} "*) targets="$targets $net" ;; esac
@@ -281,6 +288,9 @@ EOF
         internal)
           detail="skip: in-network only, no host port to probe"
           ;;
+        external)
+          detail="skip: $net is its owner's listener, not this stack's"
+          ;;
         contracted-not-yet-listening)
           if reach "$net" || hostup "$host"; then
             detail="DRIFT: $net answers — flip this row to live"
@@ -319,114 +329,66 @@ EOF
   fi
 fi
 
-# ─── 7. undeliverable payloads reach the DLQ ─────────────────────────────────
-# The gateway's DLQ used to log an event id and discard the bytes, so nothing it
-# gave up on was recoverable (its finding F-002). Since T-1.2 it retains the
-# whole envelope on `ingestion-dlq`, and since P2-C C-1 a log rejected by the
-# list's Lua cap is dead-lettered rather than dropped outright.
+# ─── 7. everything registered is actually provisioned ────────────────────────
+# registry/dependencies.tsv is where consumer projects declare what they need
+# from this stack. A row that was added but never provisioned is the same class
+# of defect as a port row that drifted from reality — an interface that exists
+# on paper and not in the stack. So read the registry and check it, rather than
+# trusting that bootstrap ran.
 #
-# Asserting the key merely exists would prove nothing — it is empty on a healthy
-# stack. So this check INDUCES a real failure: fill `ingestion-logs` to its cap,
-# post one log, and confirm the payload is retained with the right reason.
-#
-# This check mutates `ingestion-logs` and restores its depth afterwards. It is
-# the only destructive check in the suite; it runs last for that reason.
-head_ "7. Undeliverable payload is retained in the DLQ"
+# Only `topic` and `bucket` rows are provisioned here. `redis-key` rows are
+# created by their owner on first write and `port` rows are reserved for a
+# listener this stack does not run, so both are reported, not asserted.
+head_ "7. Registered dependencies are provisioned"
 
-REDIS="docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning"
+REGISTRY=registry/dependencies.tsv
 
-if [ -z "$(docker ps -q -f name=pulse-gateway)" ]; then
-  echo "  gateway not running (profile core/lite) — skipping"
-elif ! docker exec pulse-gateway env 2>/dev/null | grep -q '^REDIS_LIST_DLQ='; then
-  # Fail rather than skip: a running gateway that does not know about the DLQ is
-  # an image older than the config it was started with, which is exactly the
-  # drift this suite exists to catch.
-  no "gateway has no REDIS_LIST_DLQ in its environment — the image predates T-1.2; rebuild it"
-  echo "        docker compose -f compose/compose.yaml --profile full up -d --build gateway"
+if [ ! -r "$REGISTRY" ]; then
+  no "registry $REGISTRY is missing or unreadable — nothing can be provisioned from it"
 else
-  DLQ_KEY=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_DLQ=//p' | tr -d '\r')
-  LOG_KEY=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_LOGS=//p' | tr -d '\r')
-  LOG_CAP=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_LOGS_MAX_LEN=//p' | tr -d '\r')
-  echo "  dlq=$DLQ_KEY  logs=$LOG_KEY  cap=$LOG_CAP"
+  live_topics=$(kexec /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list 2>/dev/null | tr -d '\r')
+  live_buckets=$(wget_ -q -O- "${GCS}/storage/v1/b?project=pulse-local" 2>/dev/null)
 
-  dlq_before=$($REDIS LLEN "$DLQ_KEY" 2>/dev/null | tr -d '\r'); dlq_before=${dlq_before:-0}
-  log_before=$($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r'); log_before=${log_before:-0}
+  missing=""
+  printf '  %-11s %-21s %-30s %s\n' KIND NAME OWNER RESULT
+  while read -r kind name owner spec; do
+    case "$kind" in ''|\#*) continue ;; esac
+    [ -n "$name" ] || continue
+    case "$kind" in
+      topic)
+        if printf '%s\n' "$live_topics" | grep -qx "$name"; then
+          detail="provisioned"
+        else
+          detail="MISSING from Kafka"
+          missing="$missing $name"
+        fi
+        ;;
+      bucket)
+        if printf '%s' "$live_buckets" | grep -q "\"$name\""; then
+          detail="provisioned"
+        else
+          detail="MISSING from object storage"
+          missing="$missing $name"
+        fi
+        ;;
+      redis-key)
+        detail="declared ($spec) — created by its owner on first write"
+        ;;
+      port)
+        detail="reserved ($spec) — listener is the owner's, not this stack's"
+        ;;
+      *)
+        detail="unknown kind — not provisioned"
+        missing="$missing $name"
+        ;;
+    esac
+    printf '  %-11s %-21s %-30s %s\n' "$kind" "$name" "$owner" "$detail"
+  done < "$REGISTRY"
 
-  # Fill to the cap in one server-side loop rather than thousands of round trips.
-  need=$(( LOG_CAP - log_before ))
-  if [ "$need" -gt 0 ]; then
-    # docker exec needs -i here: without it stdin is not forwarded and
-    # redis-cli --eval silently reads an empty script, filling nothing.
-    docker exec -i pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
-      --eval /dev/stdin "$LOG_KEY" , "$need" >/dev/null 2>&1 <<'LUA'
-for i = 1, tonumber(ARGV[1]) do
-  redis.call('RPUSH', KEYS[1], '{"_pulse_infra_verify_filler":true}')
-end
-return 1
-LUA
-  fi
-  echo "  LLEN $LOG_KEY: $log_before -> $($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r') (cap $LOG_CAP)"
-
-  LOGP='{"event_id":"01JVERIFYDLQ00000000001","timestamp":"2026-01-01T00:00:00.000Z","severity":"ERROR","message":"pulse-infra-verify dlq induction"}'
-  lcode=$(curl -s -o /tmp/pulse-verify-dlq -w '%{http_code}' \
-    -X POST http://localhost:8080/telemetry/logs/v1 \
-    -H 'Content-Type: application/json' \
-    -H 'x-client-id: pulse_infra_smoke' \
-    -H 'x-api-key: local-not-a-secret-smoke-key' \
-    -d "$LOGP" 2>/dev/null)
-  echo "  POST /telemetry/logs/v1 (list at cap) -> HTTP $lcode"
-
-  # 202 is correct here and is not a contradiction: the list is full, not the
-  # in-memory buffer. Saturation of the BUFFER is what returns 503; a backend
-  # that rejects the write afterwards is a delivery failure, and delivery
-  # failures are what the DLQ is for.
-  if [ "$lcode" = "202" ]; then
-    ok "gateway accepted the log (202 — the buffer had room; the backend rejects it later)"
+  if [ -n "$missing" ]; then
+    no "registered but not provisioned:$missing — re-run \`make up\`, or bootstrap failed"
   else
-    no "gateway returned $lcode (expected 202)"
-  fi
-
-  # Worker flush + retry budget. WORKER_FLUSH_MS is small, but a LOGS_LIST_FULL
-  # is routed as an invalid payload, so it is dead-lettered without retrying.
-  sleep 3
-  dlq_after=$($REDIS LLEN "$DLQ_KEY" 2>/dev/null | tr -d '\r'); dlq_after=${dlq_after:-0}
-  echo "  LLEN $DLQ_KEY: $dlq_before -> $dlq_after"
-
-  if [ "$dlq_after" -gt "$dlq_before" ]; then
-    ok "undeliverable payload was retained in $DLQ_KEY"
-  else
-    no "nothing reached $DLQ_KEY — the payload was lost, not dead-lettered"
-  fi
-
-  newest_dlq=$($REDIS LRANGE "$DLQ_KEY" -1 -1 2>/dev/null)
-  echo "  --- newest DLQ entry ---"
-  printf '%s\n' "$newest_dlq" | sed 's/^/  /' | head -6
-
-  # The reason is what makes an entry triageable, and it is a metric label too.
-  if printf '%s' "$newest_dlq" | grep -q 'logs_list_full'; then
-    ok "DLQ entry carries error_reason=logs_list_full"
-  else
-    no "DLQ entry has no logs_list_full reason — cannot be triaged or alerted on"
-  fi
-
-  # The envelope must be whole, not a summary: replay depends on it.
-  if printf '%s' "$newest_dlq" | grep -q '"payload"' && printf '%s' "$newest_dlq" | grep -q 'gateway_id'; then
-    ok "DLQ entry retains the full envelope (payload + gateway_id) — replayable"
-  else
-    no "DLQ entry is missing payload or gateway_id — not replayable"
-  fi
-
-  # Restore the log list to the depth we found it at.
-  #
-  # Note LTRIM 0 -1 keeps EVERYTHING rather than nothing, so the log_before=0
-  # case cannot be expressed as a trim and needs the DEL.
-  if [ "$need" -gt 0 ]; then
-    if [ "$log_before" -eq 0 ]; then
-      $REDIS DEL "$LOG_KEY" >/dev/null 2>&1
-    else
-      $REDIS LTRIM "$LOG_KEY" 0 $(( log_before - 1 )) >/dev/null 2>&1
-    fi
-    echo "  restored LLEN $LOG_KEY -> $($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r') (was $log_before)"
+    ok "every provisioned-kind registry row exists in the stack"
   fi
 fi
 

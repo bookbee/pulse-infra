@@ -2,12 +2,16 @@
 #
 # LOCAL DEVELOPMENT ONLY. Not staging, not production. See docs/divergences.md.
 #
+# THIS FILE RUNS BACKING SERVICES ONLY. No consumer project is built, started or
+# configured here — they run their own containers and connect in. What gets
+# provisioned comes from registry/dependencies.tsv, where projects register it.
+#
 # Images are pinned by manifest-list digest (multi-arch: linux/amd64 + linux/arm64).
 # Digests and their resolution date live in ../images.lock — bump them there, deliberately.
 #
 # Profiles:
 #   core  Kafka cluster (3 brokers) + fake-gcs-server       — the ingestor's world
-#   full  everything: Kafka + Redis + fake-gcs + gateway    — end-to-end local runs
+#   full  every backing service: Kafka + Redis + fake-gcs   — what consumers connect to
 #   lite  single-broker Kafka + fake-gcs-server             — low-resource fallback
 #
 # lite and core/full share host ports and MUST NOT run simultaneously. `make reset`
@@ -169,9 +173,11 @@ services:
       start_period: 5s
     networks: [pulse]
 
-  # ─── Redis: gateway's queue backend ────────────────────────────────────────
-  # noeviction is load-bearing: the gateway's error model depends on writes
-  # failing loudly rather than keys being evicted out from under a consumer.
+  # ─── Redis: queue backend for whoever registers keys against it ────────────
+  # noeviction is load-bearing, and it is a promise to the owners of those keys:
+  # writes fail loudly rather than keys being evicted out from under a consumer.
+  # Changing it changes their error model, so it is contract. See the Redis
+  # section of docs/stack-contract.md.
   redis:
     image: redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     container_name: pulse-redis
@@ -190,8 +196,8 @@ services:
     volumes: ["redis-data:/data"]
     # F-013: with appendonly on, SIGTERM makes Redis flush the AOF before
     # exiting. Measured 0.4s at this data size, so the implicit default is not
-    # currently binding — but this is the container holding everything the
-    # gateway just worked so hard to drain, and the cost of being explicit is
+    # currently binding — but this is the container holding everything a
+    # producer just worked to drain into it, and the cost of being explicit is
     # zero. 15s is ample for a 512mb cap.
     stop_grace_period: 15s
     healthcheck:
@@ -221,8 +227,9 @@ services:
       TOPIC_REPLICATION_FACTOR: "3"
       TOPIC_MIN_INSYNC_REPLICAS: "2"
       GCS_ENDPOINT: http://fake-gcs:4443
-      GCS_BUCKET: pulse-staging-local
-    volumes: ["../bootstrap:/bootstrap:ro"]
+    # WHAT to provision comes from the registry, not from this file: consumer
+    # projects declare their topics and buckets there. See ../registry/dependencies.tsv.
+    volumes: ["../bootstrap:/bootstrap:ro", "../registry:/registry:ro"]
     entrypoint: ["/bin/bash", "/bootstrap/bootstrap.sh"]
     restart: "no"
     networks: [pulse]
@@ -242,86 +249,11 @@ services:
       TOPIC_REPLICATION_FACTOR: "1"
       TOPIC_MIN_INSYNC_REPLICAS: "1"
       GCS_ENDPOINT: http://fake-gcs:4443
-      GCS_BUCKET: pulse-staging-local
-    volumes: ["../bootstrap:/bootstrap:ro"]
+    # WHAT to provision comes from the registry, not from this file: consumer
+    # projects declare their topics and buckets there. See ../registry/dependencies.tsv.
+    volumes: ["../bootstrap:/bootstrap:ro", "../registry:/registry:ro"]
     entrypoint: ["/bin/bash", "/bootstrap/bootstrap.sh"]
     restart: "no"
-    networks: [pulse]
-
-  # ─── pulse-gateway ─────────────────────────────────────────────────────────
-  # Built from the sibling repo using ITS OWN Dockerfile, so the local stack and
-  # anything else building that image (CI, a dev environment) produce the same
-  # thing from the same recipe.
-  # PREREQUISITE: ../../pulse-gateway must be checked out. This service is the
-  # one thing in the stack that is NOT digest-pinned; it is built from source,
-  # so it follows whatever commit is checked out there.
-  gateway:
-    build:
-      context: ../../pulse-gateway
-      dockerfile: Dockerfile
-    image: pulse-infra/gateway:local
-    container_name: pulse-gateway
-    profiles: [full]
-    depends_on:
-      redis: {condition: service_healthy}
-      bootstrap: {condition: service_completed_successfully}
-    env_file: ["./gateway.env"]
-    volumes:
-      - "../bootstrap/fixtures/api_keys.local.json:/etc/pulse/auth_keys.json:ro"
-    # HTTP only. The gRPC port, 9090, is CONTRACTED BUT DELIBERATELY NOT
-    # PUBLISHED: pulse-gateway's ADR-009 ratified a grpc-go server on its own
-    # port beside Fiber, and docs/stack-contract.md carries the address so
-    # pulse-client can resolve it — but every GRPC-* requirement is MISS at the
-    # gateway's current commit and nothing binds 9090 inside this container.
-    #
-    # Publishing it now would save one line of diff later and cost nothing to
-    # start, but `make ps` and `make health` would advertise
-    # 0.0.0.0:9090->9090/tcp for an endpoint that refuses every connection —
-    # health output that lies, which is precisely what this stack exists to
-    # avoid. Not publishing costs a second edit when the listener lands, in a
-    # change that must touch stack-contract.md anyway to flip that row from
-    # `contracted-not-yet-listening` to `live`. Add "9090:9090" here in that
-    # same change, never before it.
-    ports: ["8080:8080"]
-    # F-013. Must exceed the gateway's own worst-case shutdown, or Docker
-    # SIGKILLs mid-drain and every accepted-but-unpublished event is lost with
-    # no flush, no dead-letter and no log — silently undoing DEL-008, which made
-    # the gateway flush in-flight batches on a context that outlives cancellation.
-    #
-    # Budget, from gateway.env and the gateway's shutdown path:
-    #   SHUTDOWN_TIMEOUT=30s .................................. 30s
-    #     (fiber shutdown + drainBuffers share one 30s context)
-    #   one flush round, per worker, in parallel:
-    #   (WORKER_MAX_RETRIES 3 + 1) x WORKER_PUBLISH_TIMEOUT_MS 6s  24s
-    #   ------------------------------------------------------------------
-    #                                                            54s -> 60s
-    # Measured against a live stack: a round does take ~24s, and the drain does
-    # abort at 30s, so the arithmetic holds. 45s would not.
-    #
-    # This is a ceiling, not a cost. With Redis healthy the drain finishes and
-    # the process exits in ~0.9s even under 4k events of load (verified).
-    #
-    # KNOWN GAP — 60s is not sufficient when Redis is UNREACHABLE, and no fixed
-    # value here would be. The budget above assumes ONE post-drain flush round,
-    # but workerLoop's select has ctx.Done() as one case among six buffer-channel
-    # receives, and Go picks randomly among ready cases: while events remain
-    # buffered, a worker keeps taking them and flushing 100-event batches instead
-    # of returning. Each round costs another ~24s, so the tail scales with the
-    # backlog (up to 45k buffered events), not with this constant. Measured with
-    # Redis paused: round 1 at +24s, drain abort at +30s, round 2 at +49s,
-    # SIGKILL at 60s mid-round-3 — for a backlog of only 300 events.
-    # Fixing that means bounding the post-cancel flush in pulse-gateway
-    # (internal/worker/pool.go); it cannot be fixed from this file. See F-013.
-    #
-    # If you change SHUTDOWN_TIMEOUT, WORKER_MAX_RETRIES or
-    # WORKER_PUBLISH_TIMEOUT_MS in gateway.env, recompute this.
-    stop_grace_period: 60s
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/livez >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 5s
     networks: [pulse]
 
 # ─── Extension point: Iceberg REST catalog (silver) ──────────────────────────
