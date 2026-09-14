@@ -9,6 +9,8 @@
 #   3 write an object to the bucket at the agreed path; read it back
 #   4 kill one broker; confirm the cluster stays writable
 #   5 gateway accepts a telemetry event and it lands in Redis
+#   6 every port the stack contract marks `live` actually answers
+#   7 an undeliverable payload is retained in the DLQ, not lost
 #
 # Cold start, reset, and reproducibility (brief steps 1, 5, 6) are lifecycle
 # operations driven from the Makefile — see README "Verification".
@@ -165,6 +167,264 @@ if [ -n "$(docker ps -q -f name=pulse-gateway)" ]; then
   curl -s http://localhost:8080/readyz | sed 's/^/  /'; echo
 else
   echo "  gateway not running (profile core/lite) — skipping"
+fi
+
+# ─── 6. contract ports match reality ─────────────────────────────────────────
+# The Ports table in docs/stack-contract.md is what four other repos resolve
+# addresses from, and until now nothing stopped it drifting from the stack it
+# describes. This check reads the table and probes it, in both directions:
+#
+#   live                          must answer, or the suite FAILS
+#   live (lite) / internal        skipped, with the reason printed
+#   contracted-not-yet-listening  skipped, but if it DOES answer that is
+#                                 reported as drift — the listener landed and
+#                                 the row was never flipped to `live`
+#
+# Skipping is never silent: a row that is not checked says why it was not.
+# See "Changing this contract" in docs/stack-contract.md.
+head_ "6. Contract ports match the running stack"
+
+CONTRACT=docs/stack-contract.md
+TAB=$(printf '\t')
+
+# service <TAB> in-network <TAB> host <TAB> status, one line per Ports row.
+# "### " subsections do not close the section; the next "## " heading does.
+rows=$(awk -F'|' '
+  /^## Ports/ { in_s=1; next }
+  /^## /      { in_s=0 }
+  !in_s       { next }
+  /^\|/ {
+    svc=$2; net=$3; host=$4; st=$5
+    gsub(/`|\*/, "", svc); gsub(/`|\*/, "", net)
+    gsub(/`|\*/, "", host); gsub(/`|\*/, "", st)
+    gsub(/^[ \t]+|[ \t]+$/, "", svc); gsub(/^[ \t]+|[ \t]+$/, "", net)
+    gsub(/^[ \t]+|[ \t]+$/, "", host); gsub(/^[ \t]+|[ \t]+$/, "", st)
+    if (svc == "" || svc == "Service" || svc ~ /^-+$/) next
+    printf "%s\t%s\t%s\t%s\n", svc, net, host, st
+  }' "$CONTRACT")
+
+if [ -z "$rows" ]; then
+  no "could not parse the Ports table in $CONTRACT — check 6 proves nothing"
+else
+  # Which compose services are actually up, across every profile. A row for a
+  # service this profile does not run is skipped, not failed (same shape as
+  # check 5), so `core` and `lite` runs stay meaningful.
+  running=" $(docker compose -f compose/compose.yaml \
+                --profile full --profile core --profile lite ps \
+                --format '{{.Service}}' 2>/dev/null | tr '\n' ' ') "
+
+  # Collect in-network targets first so they cost ONE container, not one each.
+  targets=""
+  while IFS="$TAB" read -r svc net host st; do
+    [ -n "$svc" ] || continue
+    case "$st" in live|"live (lite)"|contracted-not-yet-listening) ;; *) continue ;; esac
+    case "$net" in *:*) ;; *) continue ;; esac
+    case "$running" in *" ${net%%:*} "*) targets="$targets $net" ;; esac
+  done <<EOF
+$rows
+EOF
+
+  # bash 3.2 (macOS) has no associative arrays, so grep the batch probe output.
+  # /dev/tcp rather than nc: nc is not on every host, and every target here is
+  # loopback or a docker network, where a refusal comes back immediately.
+  reach() { printf '%s\n' "$netout" | grep -qx "OK $1"; }
+  hostup() {
+    case "$1" in *:*) ;; *) return 1 ;; esac
+    (exec 3<>"/dev/tcp/${1%:*}/${1##*:}") 2>/dev/null
+  }
+
+  # Probe, classify, and retry the whole pass if anything live looks down.
+  # Check 4 restarts a broker immediately before this one, and a container that
+  # is running is not yet a process that has bound its port — without the retry
+  # this check would flake on exactly the failure it exists to rule out.
+  broken=""; drift=""; table=""
+  attempt=1
+  while : ; do
+    broken=""; drift=""; table=""
+
+    netout=""
+    if [ -n "$targets" ]; then
+      netout=$(docker run --rm --network "$NET" --entrypoint bash "$KAFKA_IMAGE" -c '
+        for t in "$@"; do
+          h=${t%%:*}; p=${t##*:}
+          if (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null; then echo "OK $t"; else echo "NO $t"; fi
+        done' bash $targets 2>/dev/null)
+    fi
+
+    while IFS="$TAB" read -r svc net host st; do
+      [ -n "$svc" ] || continue
+      cs=${net%%:*}
+      detail=""
+      case "$st" in
+        live|"live (lite)")
+          case "$running" in
+            *" $cs "*)
+              if reach "$net" && hostup "$host"; then
+                detail="ok: $net, $host — both answer"
+              elif reach "$net"; then
+                detail="FAIL: $host UNREACHABLE ($net ok)"
+                broken="$broken $svc"
+              elif hostup "$host"; then
+                detail="FAIL: $net UNREACHABLE ($host ok)"
+                broken="$broken $svc"
+              else
+                detail="FAIL: neither $net nor $host answers"
+                broken="$broken $svc"
+              fi
+              ;;
+            *) detail="skip: $cs not running on this profile" ;;
+          esac
+          ;;
+        internal)
+          detail="skip: in-network only, no host port to probe"
+          ;;
+        contracted-not-yet-listening)
+          if reach "$net" || hostup "$host"; then
+            detail="DRIFT: $net answers — flip this row to live"
+            drift="$drift $svc"
+          else
+            detail="skip: nothing answers on $net yet (expected)"
+          fi
+          ;;
+        *)
+          detail="skip: unrecognised status '$st'"
+          ;;
+      esac
+      table="$table$(printf '  %-17s  %-29s  %s' "$svc" "$st" "$detail")
+"
+    done <<EOF
+$rows
+EOF
+
+    if [ -z "$broken" ] || [ "$attempt" -ge 3 ]; then break; fi
+    echo "  (retrying$broken — may still be starting)"
+    attempt=$((attempt + 1))
+    sleep 3
+  done
+
+  printf '  %-17s  %-29s  %s\n' SERVICE STATUS DETAIL
+  printf '%s' "$table"
+
+  if [ -n "$broken" ]; then
+    no "live-marked contract ports unreachable:$broken"
+  else
+    ok "every live-marked contract port answers; non-live rows skipped with a reason"
+  fi
+  if [ -n "$drift" ]; then
+    printf '  \033[33mNOTE\033[0m  contracted-not-yet-listening but answering:%s\n' "$drift"
+    printf '        The listener landed. Update %s in the same change.\n' "$CONTRACT"
+  fi
+fi
+
+# ─── 7. undeliverable payloads reach the DLQ ─────────────────────────────────
+# The gateway's DLQ used to log an event id and discard the bytes, so nothing it
+# gave up on was recoverable (its finding F-002). Since T-1.2 it retains the
+# whole envelope on `ingestion-dlq`, and since P2-C C-1 a log rejected by the
+# list's Lua cap is dead-lettered rather than dropped outright.
+#
+# Asserting the key merely exists would prove nothing — it is empty on a healthy
+# stack. So this check INDUCES a real failure: fill `ingestion-logs` to its cap,
+# post one log, and confirm the payload is retained with the right reason.
+#
+# This check mutates `ingestion-logs` and restores its depth afterwards. It is
+# the only destructive check in the suite; it runs last for that reason.
+head_ "7. Undeliverable payload is retained in the DLQ"
+
+REDIS="docker exec pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning"
+
+if [ -z "$(docker ps -q -f name=pulse-gateway)" ]; then
+  echo "  gateway not running (profile core/lite) — skipping"
+elif ! docker exec pulse-gateway env 2>/dev/null | grep -q '^REDIS_LIST_DLQ='; then
+  # Fail rather than skip: a running gateway that does not know about the DLQ is
+  # an image older than the config it was started with, which is exactly the
+  # drift this suite exists to catch.
+  no "gateway has no REDIS_LIST_DLQ in its environment — the image predates T-1.2; rebuild it"
+  echo "        docker compose -f compose/compose.yaml --profile full up -d --build gateway"
+else
+  DLQ_KEY=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_DLQ=//p' | tr -d '\r')
+  LOG_KEY=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_LOGS=//p' | tr -d '\r')
+  LOG_CAP=$(docker exec pulse-gateway env | sed -n 's/^REDIS_LIST_LOGS_MAX_LEN=//p' | tr -d '\r')
+  echo "  dlq=$DLQ_KEY  logs=$LOG_KEY  cap=$LOG_CAP"
+
+  dlq_before=$($REDIS LLEN "$DLQ_KEY" 2>/dev/null | tr -d '\r'); dlq_before=${dlq_before:-0}
+  log_before=$($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r'); log_before=${log_before:-0}
+
+  # Fill to the cap in one server-side loop rather than thousands of round trips.
+  need=$(( LOG_CAP - log_before ))
+  if [ "$need" -gt 0 ]; then
+    # docker exec needs -i here: without it stdin is not forwarded and
+    # redis-cli --eval silently reads an empty script, filling nothing.
+    docker exec -i pulse-redis redis-cli -a pulse-local-not-a-secret --no-auth-warning \
+      --eval /dev/stdin "$LOG_KEY" , "$need" >/dev/null 2>&1 <<'LUA'
+for i = 1, tonumber(ARGV[1]) do
+  redis.call('RPUSH', KEYS[1], '{"_pulse_infra_verify_filler":true}')
+end
+return 1
+LUA
+  fi
+  echo "  LLEN $LOG_KEY: $log_before -> $($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r') (cap $LOG_CAP)"
+
+  LOGP='{"event_id":"01JVERIFYDLQ00000000001","timestamp":"2026-01-01T00:00:00.000Z","severity":"ERROR","message":"pulse-infra-verify dlq induction"}'
+  lcode=$(curl -s -o /tmp/pulse-verify-dlq -w '%{http_code}' \
+    -X POST http://localhost:8080/telemetry/logs/v1 \
+    -H 'Content-Type: application/json' \
+    -H 'x-client-id: pulse_infra_smoke' \
+    -H 'x-api-key: local-not-a-secret-smoke-key' \
+    -d "$LOGP" 2>/dev/null)
+  echo "  POST /telemetry/logs/v1 (list at cap) -> HTTP $lcode"
+
+  # 202 is correct here and is not a contradiction: the list is full, not the
+  # in-memory buffer. Saturation of the BUFFER is what returns 503; a backend
+  # that rejects the write afterwards is a delivery failure, and delivery
+  # failures are what the DLQ is for.
+  if [ "$lcode" = "202" ]; then
+    ok "gateway accepted the log (202 — the buffer had room; the backend rejects it later)"
+  else
+    no "gateway returned $lcode (expected 202)"
+  fi
+
+  # Worker flush + retry budget. WORKER_FLUSH_MS is small, but a LOGS_LIST_FULL
+  # is routed as an invalid payload, so it is dead-lettered without retrying.
+  sleep 3
+  dlq_after=$($REDIS LLEN "$DLQ_KEY" 2>/dev/null | tr -d '\r'); dlq_after=${dlq_after:-0}
+  echo "  LLEN $DLQ_KEY: $dlq_before -> $dlq_after"
+
+  if [ "$dlq_after" -gt "$dlq_before" ]; then
+    ok "undeliverable payload was retained in $DLQ_KEY"
+  else
+    no "nothing reached $DLQ_KEY — the payload was lost, not dead-lettered"
+  fi
+
+  newest_dlq=$($REDIS LRANGE "$DLQ_KEY" -1 -1 2>/dev/null)
+  echo "  --- newest DLQ entry ---"
+  printf '%s\n' "$newest_dlq" | sed 's/^/  /' | head -6
+
+  # The reason is what makes an entry triageable, and it is a metric label too.
+  if printf '%s' "$newest_dlq" | grep -q 'logs_list_full'; then
+    ok "DLQ entry carries error_reason=logs_list_full"
+  else
+    no "DLQ entry has no logs_list_full reason — cannot be triaged or alerted on"
+  fi
+
+  # The envelope must be whole, not a summary: replay depends on it.
+  if printf '%s' "$newest_dlq" | grep -q '"payload"' && printf '%s' "$newest_dlq" | grep -q 'gateway_id'; then
+    ok "DLQ entry retains the full envelope (payload + gateway_id) — replayable"
+  else
+    no "DLQ entry is missing payload or gateway_id — not replayable"
+  fi
+
+  # Restore the log list to the depth we found it at.
+  #
+  # Note LTRIM 0 -1 keeps EVERYTHING rather than nothing, so the log_before=0
+  # case cannot be expressed as a trim and needs the DEL.
+  if [ "$need" -gt 0 ]; then
+    if [ "$log_before" -eq 0 ]; then
+      $REDIS DEL "$LOG_KEY" >/dev/null 2>&1
+    else
+      $REDIS LTRIM "$LOG_KEY" 0 $(( log_before - 1 )) >/dev/null 2>&1
+    fi
+    echo "  restored LLEN $LOG_KEY -> $($REDIS LLEN "$LOG_KEY" 2>/dev/null | tr -d '\r') (was $log_before)"
+  fi
 fi
 
 head_ "Summary"

@@ -22,7 +22,7 @@ sibling repo `../pulse-gateway` checked out.
 
 ```bash
 make up          # cold start from nothing, full profile
-make verify      # prove the contract: 12 checks, real output
+make verify      # prove the contract: 13 checks, real output
 make down        # stop, keep data
 make reset       # wipe this stack's volumes, back to known-clean
 ```
@@ -152,9 +152,18 @@ observed, not just pass/fail:
    cluster; show the under-replicated partitions; restart the broker
 5. Gateway ingest via API key **and** via a minted JWT; confirm both land in the
    Redis stream and that only the JWT envelope carries `event_header`
+6. Read the Ports table in `docs/stack-contract.md` and probe every row: an
+   address marked `live` that does not answer **fails the suite**, and a row
+   marked `contracted-not-yet-listening` that *does* answer is reported as drift
 
 Cold start, reset and reproducibility are lifecycle operations rather than
 suite checks — `make reset && make up` twice, which the table above documents.
+
+Check 6 is what keeps the contract page honest: the table four other repos
+resolve addresses from is now machine-checked against the stack it claims to
+describe, in both directions. Rows that are deliberately not live — `internal`,
+`live (lite)`, `contracted-not-yet-listening` — are skipped **with their reason
+printed**, never silently.
 
 ## Troubleshooting
 
@@ -209,7 +218,7 @@ pulse-infra/
 │   └── gateway.env                    all 47 gateway config vars (local fixtures)
 ├── bootstrap/
 │   ├── bootstrap.sh                   readiness gates, topics, bucket (idempotent)
-│   ├── verify.sh                      the 12-check verification suite
+│   ├── verify.sh                      the 13-check verification suite
 │   ├── resolve-digests.sh             digest drift report
 │   ├── mint-dev-jwt.sh                generate a local HS256 token
 │   └── fixtures/

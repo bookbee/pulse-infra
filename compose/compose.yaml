@@ -268,6 +268,20 @@ services:
     env_file: ["./gateway.env"]
     volumes:
       - "../bootstrap/fixtures/api_keys.local.json:/etc/pulse/auth_keys.json:ro"
+    # HTTP only. The gRPC port, 9090, is CONTRACTED BUT DELIBERATELY NOT
+    # PUBLISHED: pulse-gateway's ADR-009 ratified a grpc-go server on its own
+    # port beside Fiber, and docs/stack-contract.md carries the address so
+    # pulse-client can resolve it — but every GRPC-* requirement is MISS at the
+    # gateway's current commit and nothing binds 9090 inside this container.
+    #
+    # Publishing it now would save one line of diff later and cost nothing to
+    # start, but `make ps` and `make health` would advertise
+    # 0.0.0.0:9090->9090/tcp for an endpoint that refuses every connection —
+    # health output that lies, which is precisely what this stack exists to
+    # avoid. Not publishing costs a second edit when the listener lands, in a
+    # change that must touch stack-contract.md anyway to flip that row from
+    # `contracted-not-yet-listening` to `live`. Add "9090:9090" here in that
+    # same change, never before it.
     ports: ["8080:8080"]
     # F-013. Must exceed the gateway's own worst-case shutdown, or Docker
     # SIGKILLs mid-drain and every accepted-but-unpublished event is lost with

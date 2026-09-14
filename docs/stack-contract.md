@@ -162,9 +162,10 @@ The gateway's contract, as implemented in its `internal/queue/redis/producer.go`
 
 | Key | Structure | Written by | Read by | Cap (local) |
 |---|---|---|---|---|
-| `ingestion-events` | **Stream** (`XADD`) | gateway | `pulse-conflux` | `MAXLEN ~10000` |
-| `ingestion-signals` | **Stream** (`XADD`) | gateway | `pulse-conflux` | `MAXLEN ~10000` |
-| `ingestion-logs` | **List** (`RPUSH` via Lua + `EXPIRE`) | gateway | `pulse-conflux` | 10000 entries, TTL 120s |
+| `ingestion-events` | **Stream** (`XADD`) | gateway | `pulse-conflux` | `MAXLEN ~10000` **and** 30-min age trim |
+| `ingestion-signals` | **Stream** (`XADD`) | gateway | `pulse-conflux` | `MAXLEN ~10000` **and** 30-min age trim |
+| `ingestion-logs` | **List** (`RPUSH` via Lua + `EXPIRE`) | gateway | `pulse-conflux` | 10000 entries; key TTL 120s — *idle purge only* |
+| `ingestion-dlq` | **List** (`RPUSH` + `LTRIM` + `EXPIRE`) | gateway | **nobody — operators, for replay** | 10000 entries, TTL 7d |
 
 - Auth: `requirepass pulse-local-not-a-secret`, database `0`.
 - `maxmemory 512mb`, **`maxmemory-policy noeviction`**. The policy is
@@ -174,9 +175,28 @@ The gateway's contract, as implemented in its `internal/queue/redis/producer.go`
   envelope. Not one Redis field per envelope key.
 - **Both destinations are lossy under lag, in different ways.** Streams trim
   (approximate trimming, `REDIS_STREAM_APPROX_MAX_LEN=true`); the log list's Lua
-  script **drops the write outright** once the cap is hit and returns
-  `LOGS_LIST_FULL`. Neither applies backpressure to the gateway, so **consumer
-  lag is the metric that matters** — falling behind means data loss upstream.
+  script refuses the write once the cap is hit and returns `LOGS_LIST_FULL`.
+  Neither applies backpressure to the gateway, so **consumer lag is the metric
+  that matters** — falling behind means data loss upstream.
+- **Changed 2026-09-14 (gateway `P2-C` C-1):** a `LOGS_LIST_FULL` payload is no
+  longer dropped outright. It is dead-lettered to `ingestion-dlq`, so it is
+  recoverable. The stream trim path is still a silent loss.
+- **`ingestion-dlq` is not telemetry.** It holds `EnrichedPayload` envelopes the
+  gateway could not deliver, each stamped with an `error_reason`. `pulse-conflux`
+  must **not** consume it as a normal source: replaying it is a deliberate
+  operator action, not part of the pipeline. Reasons are `buffer_overflow`,
+  `max_retries_exceeded`, `shutdown_during_retry`, `logs_list_full`,
+  `dlq_sink_failed`.
+- **Stream age trim vs the log list TTL are not the same mechanism.**
+  `REDIS_STREAM_RETENTION_SECONDS` age-trims stream *entries* (`XTRIM MINID ~`),
+  so a consumer sees a moving 30-minute window regardless of volume.
+  `REDIS_LIST_LOGS_TTL_SECONDS` expires the log list *key* and is refreshed on
+  every push, so it only purges an **idle** list — under continuous writes it
+  never fires. Redis lists have no age-based trim primitive (gateway `DEL-012`).
+- **The gateway now answers `503` when buffers saturate** rather than `202`
+  (gateway `BUF-005`), with `Retry-After: 1`. A `202` therefore now means
+  buffered *and* recoverable. Clients that treated `202` as "definitely stored"
+  were previously wrong; they are now right.
 - Caps are **10k locally, vs 100k in the gateway's own example config**. That is
   deliberate: low caps make the lossy path visible in development rather than in
   the dev environment.

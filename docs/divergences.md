@@ -37,11 +37,30 @@ disagreeing — becomes possible for the first time, and nothing in this stack's
 history will have tested it. Kafka is provisioned here and fed by
 `pulse-ingestor`'s own tests and `pulse-client`, not by the gateway.
 
-## The gateway has no gRPC endpoint
+## The gateway has no gRPC listener
 
-`pulse-client` is specified to drive "HTTP + gRPC". The gateway serves **HTTP
-only** — no gRPC dependency, no gRPC server. Any client work against a gRPC
-surface is untestable locally because the surface does not exist.
+Not "no gRPC endpoint" — the distinction matters for what you can plan against.
+The surface is **specified and ratified**: `pulse-gateway`'s `ADR-009` puts three
+unary RPCs on their own port, 9090, beside Fiber (Fiber is `fasthttp` and cannot
+serve `grpc-go` on one listener; `cmux` and Connect were considered and
+rejected), and `GRPC-001`…`GRPC-011` pin the semantics down to status-code
+mapping, metadata-carried credentials and byte-identical envelope parity with
+HTTP. The address is carried here — Ports table in
+[`stack-contract.md`](stack-contract.md), status
+`contracted-not-yet-listening`.
+
+What does not exist is the server. Every `GRPC-*` requirement is `MISS` at the
+gateway's current commit: no `grpc-go` dependency, no listener, and nothing bound
+to 9090 in this stack (the host port is not published either — that section says
+why).
+
+Consequence: **`pulse-client`'s gRPC leg cannot run locally at all** — not
+partially, not with gaps; there is nothing to connect to. That includes the
+HTTP/gRPC parity suite, which is the *external* check on the cost `ADR-009`
+knowingly accepted: auth, allowlist, rate limiting, size caps, metrics and
+request logging each get a second implementation on the gRPC side, and nothing
+local can currently catch the two drifting apart. A green local run says nothing
+whatsoever about the gRPC transport, and will not until the listener lands.
 
 ## Redis losses are silent and local caps are tighter
 
