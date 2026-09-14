@@ -12,7 +12,7 @@ covers only what they don't.
 ```bash
 make up                  # cold start, full profile (~25s warm, ~80s first build)
 make up PROFILE=core     # or lite
-make verify              # 13 checks against a live full stack
+make verify              # 17 checks against a live full stack
 make down                # stop, keep data
 make reset               # delete this stack's volumes only
 make digests             # digest drift report; writes nothing
@@ -20,7 +20,9 @@ make digests             # digest drift report; writes nothing
 
 There are no unit tests and no linter here — the artifact is a running stack, so
 `make verify` is the test suite. It needs the `full` profile up; checks 2–4 work
-on `core`, and checks 5 and 6 self-skip what the running profile doesn't have.
+on `core`, and checks 5–7 self-skip what the running profile doesn't have.
+Check 7 is the only destructive one — it fills `ingestion-logs` to its cap to
+induce a real delivery failure, then restores the depth it found.
 Check 6 parses the Ports table out of `docs/stack-contract.md` and probes it, so
 **that table is executable**: mark a row `live` and it must answer.
 
@@ -62,9 +64,12 @@ to `full` taxes every end-to-end run, so new services get their own profile.
 - **The event schema is stricter than it looks**: `event_id`, `timestamp`,
   `type`, `event` all required, `user` needs one of three id fields, `context`
   needs at least one populated field anywhere inside it. Failures are `400`.
-- **The gateway needs all 47 env vars** (`compose/gateway.env`) — it has no
-  defaults and aborts listing every missing one. `SAFE_BUFFER_THRESHOLD` is in
-  its `.env.example` but never read; it is deliberately omitted here.
+- **The gateway needs all 57 env vars** (`compose/gateway.env`) — it has no
+  defaults and aborts listing every missing one. The count grows with the
+  gateway: `SAFE_BUFFER_THRESHOLD` was inert until its `T-1.3` and is now
+  **required and validated** in `(0,1]`, and `T-1.2`/`DEL-012` added the DLQ and
+  stream-retention keys. Re-check the count against `internal/config` rather
+  than trusting this number after a gateway bump.
 - **The gateway has no Kafka producer and no gRPC listener** at its current
   commit, despite the platform diagram and `pulse-client`'s README. Both are
   *specified* upstream and neither is built — gRPC in `ADR-009` and

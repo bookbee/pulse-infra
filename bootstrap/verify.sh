@@ -188,10 +188,13 @@ CONTRACT=docs/stack-contract.md
 TAB=$(printf '\t')
 
 # service <TAB> in-network <TAB> host <TAB> status, one line per Ports row.
-# "### " subsections do not close the section; the next "## " heading does.
+# ANY heading closes the section, "###" included: the prose subsections under
+# "## Ports" contain tables of their own (the consumer address-swap table, for
+# one) and those rows are not ports. Only the table directly under the heading
+# is the contract.
 rows=$(awk -F'|' '
   /^## Ports/ { in_s=1; next }
-  /^## /      { in_s=0 }
+  /^#/        { in_s=0 }
   !in_s       { next }
   /^\|/ {
     svc=$2; net=$3; host=$4; st=$5

@@ -22,7 +22,7 @@ sibling repo `../pulse-gateway` checked out.
 
 ```bash
 make up          # cold start from nothing, full profile
-make verify      # prove the contract: 13 checks, real output
+make verify      # prove the contract: 17 checks, real output
 make down        # stop, keep data
 make reset       # wipe this stack's volumes, back to known-clean
 ```
@@ -155,6 +155,14 @@ observed, not just pass/fail:
 6. Read the Ports table in `docs/stack-contract.md` and probe every row: an
    address marked `live` that does not answer **fails the suite**, and a row
    marked `contracted-not-yet-listening` that *does* answer is reported as drift
+7. Fill `ingestion-logs` to its cap to induce a real delivery failure, then
+   confirm the refused payload is retained whole in `ingestion-dlq` with
+   `error_reason=logs_list_full` — not dropped. Restores the list depth after
+
+Check 7 is the only check that mutates state, which is why it runs last. It
+fails rather than skips if a running gateway has no `REDIS_LIST_DLQ`: that means
+the image is older than the config it was started with, which is drift this
+suite exists to catch.
 
 Cold start, reset and reproducibility are lifecycle operations rather than
 suite checks — `make reset && make up` twice, which the table above documents.
@@ -218,7 +226,7 @@ pulse-infra/
 │   └── gateway.env                    all 47 gateway config vars (local fixtures)
 ├── bootstrap/
 │   ├── bootstrap.sh                   readiness gates, topics, bucket (idempotent)
-│   ├── verify.sh                      the 13-check verification suite
+│   ├── verify.sh                      the 17-check verification suite
 │   ├── resolve-digests.sh             digest drift report
 │   ├── mint-dev-jwt.sh                generate a local HS256 token
 │   └── fixtures/

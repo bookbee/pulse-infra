@@ -62,11 +62,23 @@ request logging each get a second implementation on the gRPC side, and nothing
 local can currently catch the two drifting apart. A green local run says nothing
 whatsoever about the gRPC transport, and will not until the listener lands.
 
-## Redis losses are silent and local caps are tighter
+## Redis stream loss is silent, and local caps are tighter
 
-Both Redis destinations shed data under lag rather than applying backpressure:
-streams trim to `MAXLEN` (approximate), and the log list's Lua script drops the
-write outright once the cap is hit.
+Neither Redis destination applies backpressure to the gateway, but as of
+2026-09-14 they no longer lose data the same way:
+
+- **Streams still shed silently.** `MAXLEN` (approximate) trimming plus the
+  30-minute `XTRIM MINID` age trim both discard entries a consumer never read,
+  and nothing records that it happened. This is still real, unrecoverable loss.
+- **The log list no longer does.** A write refused by the Lua cap
+  (`LOGS_LIST_FULL`) is dead-lettered to `ingestion-dlq` with
+  `error_reason=logs_list_full` rather than dropped (gateway `P2-C` C-1), so it
+  is recoverable by a deliberate operator replay. `make verify` check 7 induces
+  exactly this failure and asserts the envelope survives it.
+
+So "Redis loses data under lag" is now only true of the streams. Do not carry
+the old assumption into consumer design: a lost *log* is a triage problem, a
+lost *stream entry* is gone.
 
 Local caps are **10k**; the gateway's own example config uses **100k**, and a
 real deployment would be larger still. So local runs hit the lossy path **sooner

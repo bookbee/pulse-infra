@@ -84,6 +84,37 @@ From the host: `localhost:19092,localhost:19093,localhost:19094`.
 `lite` and `core`/`full` both bind host port 19092 and **must not run at the
 same time**. `make reset` between profile switches.
 
+### Containerizing a consumer
+
+Every consumer repo's `.env.example` currently ships **host** addresses
+(`localhost:19092`, `localhost:6379`, `localhost:4443`) because they are written
+for a process running on the laptop. The moment that process moves into a
+container on the `pulse-infra` network, every one of those is wrong — and wrong
+in the worst way, because `localhost` inside a container resolves to the
+container itself, so the failure is a connection refused, not a name-resolution
+error that would point at the cause.
+
+Swap to the in-network column, whole:
+
+| Consumer | Host form (`.env.example` today) | In-network form (containerized) |
+|---|---|---|
+| `pulse-ingestor` | `KAFKA_BOOTSTRAP_SERVERS=localhost:19092,…3,…4` | `kafka-1:9092,kafka-2:9092,kafka-3:9092` |
+| `pulse-ingestor` | `STORAGE_EMULATOR_HOST=localhost:4443` | `fake-gcs:4443` |
+| `pulse-conflux` | `REDIS_ADDR=localhost:6379` | `redis:6379` |
+
+Topic names, bucket paths, Redis keys and credentials do **not** change — only
+the addresses. That is the whole point of the two columns.
+
+Two rules when adding the service itself:
+
+- **Its own profile, never `full`.** Every service in `full` taxes every
+  end-to-end run. The extension point at the bottom of `compose/compose.yaml`
+  shows the shape.
+- **Publish a host port only if something outside Docker needs to reach it.** A
+  consumer that only talks to Kafka and GCS needs no host port at all, and
+  therefore no new row here. If it does get one, that row lands in the same
+  change as the port — see "Changing this contract".
+
 ### Gateway gRPC, 9090 — contracted, not published
 
 `pulse-gateway` has ratified a gRPC transport on its own port: `ADR-009` in its
