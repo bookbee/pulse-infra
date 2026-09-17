@@ -108,6 +108,7 @@ processes running on the laptop outside Docker.
 | fake-gcs-server | `fake-gcs:4443` | `localhost:4443` | `live` | **HTTP**, not HTTPS |
 | Gateway HTTP | `gateway:8080` | `localhost:8080` | `external` | Run by `pulse-gateway` from its own compose file, not by this stack |
 | Gateway gRPC | `gateway:9090` | `localhost:9090` | `external` | Reserved for `pulse-gateway` `ADR-009`. **Nothing listens yet** — see below |
+| Conflux ops | `conflux:8090` | `localhost:8090` | `external` | `/livez`, `/readyz`, `/metrics`. Run by `pulse-conflux` from its own compose file, not by this stack. Not an API — there is no ingestion surface here |
 
 **Bootstrap servers**, in-network: `kafka-1:9092,kafka-2:9092,kafka-3:9092`.
 From the host: `localhost:19092,localhost:19093,localhost:19094`.
@@ -132,6 +133,11 @@ Swap to the in-network column, whole:
 | `pulse-ingestor` | `KAFKA_BOOTSTRAP_SERVERS=localhost:19092,…3,…4` | `kafka-1:9092,kafka-2:9092,kafka-3:9092` |
 | `pulse-ingestor` | `STORAGE_EMULATOR_HOST=localhost:4443` | `fake-gcs:4443` |
 | `pulse-conflux` | `REDIS_ADDR=localhost:6379` | `redis:6379` |
+
+`pulse-conflux` has done this: `pulse-conflux/compose/compose.yaml` builds from
+its own repo, joins this network as `external`, and reads
+`compose/conflux.env` — the in-network twin of its `.env.example`. Start it with
+`make local-up` there, after `make up` here.
 
 Topic names, bucket paths, Redis keys and credentials do **not** change — only
 the addresses. That is the whole point of the two columns.

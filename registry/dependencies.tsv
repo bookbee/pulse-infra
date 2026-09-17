@@ -51,12 +51,13 @@ bucket       pulse-staging-local   pulse-ingestor                 -
 # ─── Redis keys ──────────────────────────────────────────────────────────────
 # Declared, not created. Structure is the owner's contract with its consumers;
 # this stack only guarantees a Redis that honours it.
-redis-key    ingestion-events      pulse-gateway                  stream
-redis-key    ingestion-signals     pulse-gateway                  stream
-redis-key    ingestion-logs        pulse-gateway                  list
+redis-key    ingestion-events      pulse-gateway,pulse-conflux    stream
+redis-key    ingestion-signals     pulse-gateway,pulse-conflux    stream
+redis-key    ingestion-logs        pulse-gateway,pulse-conflux    list
 redis-key    ingestion-dlq         pulse-gateway                  list
 
 # ─── Port reservations ───────────────────────────────────────────────────────
 # Reserved, not served. The owner runs the listener in its own compose file.
 port         8080                  pulse-gateway                  http
 port         9090                  pulse-gateway                  grpc
+port         8090                  pulse-conflux                  http
